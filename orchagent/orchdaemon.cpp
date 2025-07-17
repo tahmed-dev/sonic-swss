@@ -69,10 +69,10 @@ BfdMonitorOrch *gBfdMonitorOrch;
 TunnelDecapOrch *gTunneldecapOrch;
 StpOrch *gStpOrch;
 MuxOrch *gMuxOrch;
-ShlOrch *gShlOrch;
 IcmpOrch *gIcmpOrch;
 HFTelOrch *gHFTOrch;
 EvpnMhOrch *gEvpnMhOrch;
+ShlOrch *gShlOrch;
 
 bool gIsNatSupported = false;
 event_handle_t g_events_handle;
@@ -470,15 +470,6 @@ bool OrchDaemon::init()
 
     gNhgMapOrch = new NhgMapOrch(m_applDb, APP_FC_TO_NHG_INDEX_MAP_TABLE_NAME);
 
-    TableConnector appDbDfTable(m_applDb, "EVPN_DF_TABLE");
-    TableConnector confDbEvpnEsTable(m_configDb, "EVPN_ETHERNET_SEGMENT");
-
-    vector<TableConnector> evpn_df_es_table_connectors = {
-        appDbDfTable,
-        confDbEvpnEsTable,
-    };
-
-    gEvpnMhOrch = new EvpnMhOrch(evpn_df_es_table_connectors);
     /*
      * The order of the orch list is important for state restore of warm start and
      * the queued processing in m_toSync map after gPortsOrch->allPortsReady() is set.
