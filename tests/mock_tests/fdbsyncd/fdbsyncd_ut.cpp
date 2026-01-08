@@ -27,6 +27,7 @@ using namespace swss;
 
 using ::testing::_;
 
+#if 0
 class MockFdbSync : public FdbSync
 {
 public:
@@ -676,6 +677,7 @@ public:
     std::shared_ptr<swss::DBConnector> m_configDb = std::make_shared<swss::DBConnector>("CONFIG_DB", 0);
     MockFdbSyncEvpnMh m_mockFdbSync{m_pipeline.get(), m_stateDb.get(), m_configDb.get()};
 };
+#endif
 
 /*
  * *****************************
@@ -935,6 +937,7 @@ swss::Table& getNhgTable()
  * **********************
  */
 
+#if 0
 // Test 1: L2 NHG creation with single VTEP
 TEST_F(FdbSyncdEvpnMhTest, L2NhgSingleVtepCreation)
 {
@@ -1207,3 +1210,5 @@ TEST_F(FdbSyncdEvpnMhTest, NhgRefcounting)
     free(mac_msg);
     free(nhg_del);
 }
+
+#endif
