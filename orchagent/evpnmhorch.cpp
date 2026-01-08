@@ -122,7 +122,6 @@ void EvpnMhOrch::updateEsCache(string &key, KeyOpFieldsValuesTuple &t)
         std::string port_name = getPortFromEsKey(key);
         std::string vlan_id = getVlanFromEsKey(key);
         Port port;
-        sai_object_id_t vlan_member_id;
 
         SWSS_LOG_NOTICE("updateEsCache: SET oper: %s, vlan: %s, port_name: %s, is_df: %d", key.c_str(), vlan_id.c_str(), port_name.c_str(), existing_entry->is_df);
 
@@ -132,17 +131,21 @@ void EvpnMhOrch::updateEsCache(string &key, KeyOpFieldsValuesTuple &t)
             return;
         }
 
-        if (gPortsOrch->getVlanMember(port_name, port, vlan_member_id))
+        vlan_members_t vlan_members;
+        if (gPortsOrch->getPortVlanMembers(port, vlan_members))
         {
-            /* TODO: Use proper attribute once its available in SAI */
-            sai_attribute_t attr;
-            attr.id = SAI_VLAN_MEMBER_ATTR_TUNNEL_TERM_BUM_TX_DROP;
-            attr.value.booldata = existing_entry->is_df;
-
-            auto status = sai_vlan_api->set_vlan_member_attribute(vlan_member_id, &attr);
-            if (status != SAI_STATUS_SUCCESS)
+            for (auto &member : vlan_members)
             {
-                /* TODO: Error handling */
+                /* TODO: Use proper attribute once its available in SAI */
+                sai_attribute_t attr;
+                attr.id = SAI_VLAN_MEMBER_ATTR_TUNNEL_TERM_BUM_TX_DROP;
+                attr.value.booldata = existing_entry->is_df;
+
+                auto status = sai_vlan_api->set_vlan_member_attribute(member.second.vlan_member_id, &attr);
+                if (status != SAI_STATUS_SUCCESS)
+                {
+                    /* TODO: Error handling */
+                }
             }
         }
         else
@@ -163,24 +166,27 @@ void EvpnMhOrch::deleteEsCache(string &key)
         std::string port_name = getPortFromEsKey(key);
         std::string vlan_id = getVlanFromEsKey(key);
         Port port;
-        sai_object_id_t vlan_member_id;
 
         if (!gPortsOrch->getPort(vlan_id, port))
         {
             SWSS_LOG_ERROR("deleteEsCache: interface: %s, Vlan is not not yet created, returning", key.c_str());
             return;
         }
-        if (gPortsOrch->getVlanMember(port_name, port, vlan_member_id))
-        {
-            /* TODO: Use proper attribute once its available in SAI */
-            sai_attribute_t attr;
-            attr.id = SAI_VLAN_MEMBER_ATTR_TUNNEL_TERM_BUM_TX_DROP;
-            attr.value.booldata = false;
 
-            auto status = sai_vlan_api->set_vlan_member_attribute(vlan_member_id, &attr);
-            if (status != SAI_STATUS_SUCCESS)
+        vlan_members_t vlan_members;
+        if (gPortsOrch->getPortVlanMembers(port, vlan_members))
+        {
+            for (auto &member : vlan_members)
             {
-                /* TODO: Error handling */
+                sai_attribute_t attr;
+                attr.id = SAI_VLAN_MEMBER_ATTR_TUNNEL_TERM_BUM_TX_DROP;
+                attr.value.booldata = false;
+
+                auto status = sai_vlan_api->set_vlan_member_attribute(member.second.vlan_member_id, &attr);
+                if (status != SAI_STATUS_SUCCESS)
+                {
+                    /* TODO: Error handling */
+                }
             }
         }
         else

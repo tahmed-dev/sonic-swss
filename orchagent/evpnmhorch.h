@@ -15,7 +15,7 @@ struct EsCacheEntry
      */
     bool is_df;
 
-    EsCacheEntry()
+    EsCacheEntry() : is_df(false)
     {
     }
 

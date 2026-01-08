@@ -16,6 +16,7 @@ namespace vuh = vxlan_ut_helpers;
 #include "gtest/gtest.h"
 
 #include "shlorch.h"
+#include "evpnmhorch.h"
 
 #define VXLAN_REMOTE_2 "EVPN_2.2.2.2"
 #define VXLAN_REMOTE_3 "EVPN_3.3.3.3"
@@ -29,6 +30,7 @@ namespace vuh = vxlan_ut_helpers;
 
 extern ShlOrch *gShlOrch;
 extern EvpnMhOrch *gEvpnMhOrch;
+extern SwitchOrch *gSwitchOrch;
 extern sai_isolation_group_api_t*  sai_isolation_group_api;
 
 namespace shlorch_test
@@ -443,7 +445,7 @@ namespace shlorch_test
             ut_orch_list.push_back((Orch **)&gRouteOrch);
             TableConnector stateDbMirrorSession(m_state_db.get(), STATE_MIRROR_SESSION_TABLE_NAME);
             TableConnector confDbMirrorSession(m_config_db.get(), CFG_MIRROR_SESSION_TABLE_NAME);
-            gMirrorOrch = new MirrorOrch(stateDbMirrorSession, confDbMirrorSession, gPortsOrch, gRouteOrch, gNeighOrch, gFdbOrch, gPolicerOrch);
+            gMirrorOrch = new MirrorOrch(stateDbMirrorSession, confDbMirrorSession, gPortsOrch, gRouteOrch, gNeighOrch, gFdbOrch, gPolicerOrch, gSwitchOrch);
             gDirectory.set(gMirrorOrch);
             ut_orch_list.push_back((Orch **)&gMirrorOrch);
 

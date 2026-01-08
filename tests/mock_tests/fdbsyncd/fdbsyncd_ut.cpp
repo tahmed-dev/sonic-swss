@@ -13,6 +13,16 @@
 #define MAX_PAYLOAD 1024
 #define ETH_ALEN 6
 
+#ifndef NDA_RTA
+#define NDA_RTA(r)                                                             \
+    ((struct rtattr *)(((char *)(r)) + NLMSG_ALIGN(sizeof(struct ndmsg))))
+#endif
+
+#ifndef RTM_NHA
+#define RTM_NHA(r)                                                             \
+    ((struct rtattr *)(((char *)(r)) + NLMSG_ALIGN(sizeof(struct nhmsg))))
+#endif
+
 using namespace swss;
 
 using ::testing::_;
@@ -28,7 +38,7 @@ public:
         m_intf_info[144] = {"Vxlan-30", 5004};
     }
 
-    ~MockFdbSync()
+    virtual ~MockFdbSync()
     {
     }
 };

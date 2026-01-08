@@ -61,6 +61,7 @@
 #include "high_frequency_telemetry/hftelorch.h"
 #include <sairedis.h>
 #include "shlorch.h"
+#include "evpnmhorch.h"
 
 using namespace swss;
 
