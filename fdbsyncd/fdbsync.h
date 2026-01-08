@@ -136,10 +136,15 @@ private:
         std::string type;
         unsigned int vni;
         std::string  ifname;
-        union {
-            std::string remote_vtep;
-            std::string nexthop_group;
-            std::string ifname;
+        struct AnonymousBuffer
+        {
+        public:
+            AnonymousBuffer() : remote_vtep(buffer), nexthop_group(buffer), ifname(buffer) {};
+            std::string &remote_vtep;
+            std::string &nexthop_group;
+            std::string &ifname;
+        private:
+            std::string buffer;
         } v;
     };
     std::unordered_map<std::string, m_mac_info> m_mac;

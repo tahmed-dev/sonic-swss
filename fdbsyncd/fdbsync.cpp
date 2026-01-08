@@ -656,7 +656,7 @@ void FdbSync::imetDelRoute(struct in_addr vtep, string vlan_str, uint32_t vni)
 
 void FdbSync::macDelVxlanDB(string key)
 {
-    string vtep = m_mac[key].vtep;
+    string vtep = m_mac[key].v.remote_vtep;
     string type;
     string vni = to_string(m_mac[key].vni);
     type = m_mac[key].type;
