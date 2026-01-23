@@ -1944,10 +1944,10 @@ void RouteSync::onMsgRaw(struct nlmsghdr *h)
         && (h->nlmsg_type != RTM_DELSRV6LOCALSID)
         && (h->nlmsg_type != RTM_NEWNEXTHOP)
         && (h->nlmsg_type != RTM_DELNEXTHOP)
-        && (h->nlmsg_type != RTM_NEWPICCONTEXT)
-        && (h->nlmsg_type != RTM_DELPICCONTEXT)
-        && (h->nlmsg_type != RTM_NEWSRV6VPNROUTE)
-        && (h->nlmsg_type != RTM_DELSRV6VPNROUTE)
+//        && (h->nlmsg_type != RTM_NEWPICCONTEXT)
+//        && (h->nlmsg_type != RTM_DELPICCONTEXT)
+//        && (h->nlmsg_type != RTM_NEWSRV6VPNROUTE)
+//        && (h->nlmsg_type != RTM_DELSRV6VPNROUTE)
         && (h->nlmsg_type != RTM_NEWTFILTER)
         && (h->nlmsg_type != RTM_DELTFILTER)
         && (h->nlmsg_type < RTM_FPM_FIRST || h->nlmsg_type > RTM_FPM_LAST))
@@ -1956,8 +1956,11 @@ void RouteSync::onMsgRaw(struct nlmsghdr *h)
     }
 
     /* Length validity. */
-    if (h->nlmsg_type == RTM_NEWNEXTHOP || h->nlmsg_type == RTM_DELNEXTHOP ||
-        h->nlmsg_type == RTM_NEWPICCONTEXT || h->nlmsg_type == RTM_DELPICCONTEXT)
+    if (h->nlmsg_type == RTM_NEWNEXTHOP
+        || h->nlmsg_type == RTM_DELNEXTHOP
+//        || h->nlmsg_type == RTM_NEWPICCONTEXT
+//        || h->nlmsg_type == RTM_DELPICCONTEXT
+        )
     {
         hdr_len = sizeof(struct nhmsg);
     }
