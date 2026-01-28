@@ -69,10 +69,10 @@ BfdMonitorOrch *gBfdMonitorOrch;
 TunnelDecapOrch *gTunneldecapOrch;
 StpOrch *gStpOrch;
 MuxOrch *gMuxOrch;
+ShlOrch *gShlOrch;
 IcmpOrch *gIcmpOrch;
 HFTelOrch *gHFTOrch;
 EvpnMhOrch *gEvpnMhOrch;
-ShlOrch *gShlOrch;
 
 bool gIsNatSupported = false;
 event_handle_t g_events_handle;

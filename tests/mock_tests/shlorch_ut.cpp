@@ -29,6 +29,7 @@ namespace vuh = vxlan_ut_helpers;
 #define VTEP_REMOTE_IP_5 "5.5.5.5"
 
 extern ShlOrch *gShlOrch;
+extern EvpnMhOrch *gEvpnMhOrch;
 extern sai_isolation_group_api_t*  sai_isolation_group_api;
 
 namespace shlorch_test
@@ -299,6 +300,8 @@ namespace shlorch_test
                 confDbEvpnEsTable,
             };
 
+            gEvpnMhOrch = new EvpnMhOrch(evpn_df_es_table_connectors);
+
             const int portsorch_base_pri = 40;
             vector<table_name_with_pri_t> ports_tables = {
                 { APP_PORT_TABLE_NAME, portsorch_base_pri + 5 },
@@ -327,10 +330,18 @@ namespace shlorch_test
             gDirectory.set(gVrfOrch);
             ut_orch_list.push_back((Orch **)&gVrfOrch);
 
-            gIntfsOrch = new IntfsOrch(m_app_db.get(), APP_INTF_TABLE_NAME, gVrfOrch, m_chassis_app_db.get());
+            //TODO: check this later
+            /*
+            vector<table_name_with_pri_t> intf_tables = {
+                { APP_INTF_TABLE_NAME,  IntfsOrch::intfsorch_pri},
+                { APP_SAG_TABLE_NAME,   IntfsOrch::intfsorch_pri}
+            };
+            */
+            gIntfsOrch = new IntfsOrch(m_app_db.get(), APP_INTF_TABLE_NAME/*intf_tables*/, gVrfOrch, m_chassis_app_db.get());
             gDirectory.set(gIntfsOrch);
             ut_orch_list.push_back((Orch **)&gIntfsOrch);
 
+            // Create SwitchOrch before PortsOrch since PortsOrch constructor needs gSwitchOrch
             TableConnector stateDbSwitchTable(m_state_db.get(), "SWITCH_CAPABILITY");
             TableConnector app_switch_table(m_app_db.get(), APP_SWITCH_TABLE_NAME);
             TableConnector conf_asic_sensors(m_config_db.get(), CFG_ASIC_SENSORS_TABLE_NAME);
@@ -541,9 +552,9 @@ namespace shlorch_test
 
         /*
          * This DB entry will cause the following operations:
-         * 1. Create Isolation group for VTEP "2.2.2.2"
+         * 1. Create Isolation group for VTEP "2.2.2.2" 
          *    with member as Ethernet4 and bind port as Tunnel port for VTEP "2.2.2.2"
-         * 2. Create Isolation group for VTEP "3.3.3.3" with member as Ethernet4
+         * 2. Create Isolation group for VTEP "3.3.3.3" with member as Ethernet4 
          *    and Tunnel port is not create yet, so Tunnel port for VTEP "3.3.3.3" is pendind bind port
          */
         shlTable.set("Vlan10:Ethernet4", {
@@ -628,7 +639,7 @@ namespace shlorch_test
          * This DB entry will cause the following operations as an Update opeartion:
          * 1. Its a no-op for Isolation group for VTEP "2.2.2.2"
          * 2. Delete the Isolation group created for VTEP "4.4.4.4"
-         * 3. Create Isolation group for VTEP "5.5.5.5"
+         * 3. Create Isolation group for VTEP "5.5.5.5" 
          *    with member as Ethernet5 and bind port as Tunnel port for VTEP "5.5.5.5"
          */
         entries.push_back({"Vlan10:Ethernet5", "SET", {
