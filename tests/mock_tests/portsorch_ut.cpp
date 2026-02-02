@@ -467,6 +467,16 @@ namespace portsorch_test
 
             gPortsOrch = new PortsOrch(m_app_db.get(), m_state_db.get(), ports_tables, m_chassis_app_db.get());
 
+            TableConnector appDbDfTable(m_app_db.get(), "EVPN_DF_TABLE");
+            TableConnector confDbEvpnEsTable(m_config_db.get(), "EVPN_ETHERNET_SEGMENT");
+
+            vector<TableConnector> evpn_df_es_table_connectors = {
+                appDbDfTable,
+                confDbEvpnEsTable,
+            };
+
+            gEvpnMhOrch = new EvpnMhOrch(evpn_df_es_table_connectors);
+
             vector<string> flex_counter_tables = {
                 CFG_FLEX_COUNTER_TABLE_NAME
             };
@@ -605,6 +615,8 @@ namespace portsorch_test
             gSwitchOrch = nullptr;
             delete gMlagOrch;
             gMlagOrch = nullptr;
+            delete gEvpnMhOrch;
+            gEvpnMhOrch = nullptr;
             // clear orchs saved in directory
             gDirectory.m_values.clear();
         }
