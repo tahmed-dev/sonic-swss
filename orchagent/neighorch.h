@@ -29,6 +29,8 @@ struct NeighborData
 {
     MacAddress    mac;
     bool          hw_configured = false; // False means, entry is not written to HW
+    bool          deletion_pending = false; // Set to true during the deletion process
+                                            // so that external neighbor lookups fail
     uint32_t      voq_encap_index = 0;
 };
 
@@ -87,12 +89,16 @@ public:
 
     bool getNeighborEntry(const NextHopKey&, NeighborEntry&, MacAddress&);
     bool getNeighborEntry(const IpAddress&, NeighborEntry&, MacAddress&);
+    bool getNeighborEntry(const IpAddress&, string vrf_name, NeighborEntry&, MacAddress&);
 
     bool enableNeighbor(const NeighborEntry&);
     bool disableNeighbor(const NeighborEntry&);
     bool enableNeighbors(std::list<NeighborContext>&);
     bool disableNeighbors(std::list<NeighborContext>&);
     bool isHwConfigured(const NeighborEntry&);
+    void processFDBDelete(const FdbEntry &entry);
+    void processFDBAdd(const FdbEntry &entry);
+    void processFDBResolve(const FdbEntry &entry);
 
     sai_object_id_t addTunnelNextHop(const NextHopKey&);
     bool removeTunnelNextHop(const NextHopKey&);
