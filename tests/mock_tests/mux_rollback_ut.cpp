@@ -34,6 +34,7 @@ namespace mux_rollback_test
     using ::testing::Throw;
     using ::testing::DoAll;
     using ::testing::SetArrayArgument;
+    using ::testing::AtLeast;
 
     static const string TEST_INTERFACE = "Ethernet4";
 
@@ -407,7 +408,8 @@ namespace mux_rollback_test
         if (!IsPrefixBasedMuxNeighbor())
         {
             EXPECT_CALL(*mock_sai_next_hop_api, remove_next_hops)
-                .WillOnce(Throw(exception()));
+                .Times(AtLeast(1))
+                .WillRepeatedly(Throw(exception()));
         }
         SetMuxStateFromAppDb(STANDBY_STATE);
         if (IsPrefixBasedMuxNeighbor())
