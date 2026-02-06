@@ -15,6 +15,7 @@
 #include "vxlanorch.h"
 #include "directory.h"
 #include "neighorch.h"
+#include "evpnmhorch.h"
 
 extern sai_fdb_api_t    *sai_fdb_api;
 
@@ -23,6 +24,7 @@ extern CrmOrch *        gCrmOrch;
 extern MlagOrch*        gMlagOrch;
 extern Directory<Orch*> gDirectory;
 extern NeighOrch*       gNeighOrch;
+extern EvpnMhOrch*      gEvpnMhOrch;
 
 const int FdbOrch::fdborch_pri = 20;
 
@@ -525,6 +527,18 @@ void FdbOrch::update(sai_fdb_event_t        type,
         }
 
         storeFdbEntryState(update);
+
+        /* Track in m_entries_by_port for EVPN MH reroute lookups.
+         * storeFdbEntryState only updates m_entries; we need the port
+         * index so evpnMhRerouteToTunnel can find MACs on a downed port. */
+        {
+            auto &port_fdb_list = m_entries_by_port[update.port.m_alias];
+            if (std::find(port_fdb_list.begin(), port_fdb_list.end(), update.entry) == port_fdb_list.end())
+            {
+                port_fdb_list.push_back(update.entry);
+            }
+        }
+
         notify(SUBJECT_TYPE_FDB_CHANGE, &update);
         if (mac_move_local)
         {
@@ -716,6 +730,9 @@ void FdbOrch::update(sai_fdb_event_t        type,
             m_portsOrch->setPort(vlan.m_alias, vlan);
         }
         storeFdbEntryState(update);
+
+        /* Remove from m_entries_by_port for EVPN MH consistency */
+        removeFdbEntryFromPortCache(update.entry, update.port);
 
         /* Remove local neighbor entry if exists
          */
@@ -1108,6 +1125,8 @@ void FdbOrch::doTask(Consumer& consumer)
             fdbData.vni = vni;
             fdbData.is_flush_pending = false;
             fdbData.discard = discard;
+
+            // set entry port_name, which is used in mux fdb update logic
             entry.port_name = port;
             if (addFdbEntry(entry, port, fdbData))
             {
@@ -1617,6 +1636,16 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
             return;
         }
 
+        /* EVPN MH: If this port is an ES member, reroute MACs to VxLAN
+         * tunnel instead of flushing them. This provides fast failover. */
+        if (gEvpnMhOrch && gEvpnMhOrch->isPortInterfaceAssociatedToEs(p.m_alias))
+        {
+            SWSS_LOG_NOTICE("EVPN MH failover: port %s is ES member, rerouting to tunnel",
+                p.m_alias.c_str());
+            evpnMhRerouteToTunnel(p);
+            return;
+        }
+
         if (p.m_bridge_port_id != SAI_NULL_OBJECT_ID)
         {
             flushFDBEntries(p.m_bridge_port_id, SAI_NULL_OBJECT_ID);
@@ -1637,9 +1666,241 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
             }
             notifyObserversFDBFlush(p, vlan.m_vlan_info.vlan_oid);
         }
+    }
+    else if (update.operStatus == SAI_PORT_OPER_STATUS_UP)
+    {
+        swss::Port p = update.port;
 
+        /* EVPN MH: If this port was previously failed over, restore MACs
+         * back to the local port from the VxLAN tunnel. */
+        if (gEvpnMhOrch && gEvpnMhOrch->isPortInterfaceAssociatedToEs(p.m_alias))
+        {
+            if (m_reroutedEntries.find(p.m_alias) != m_reroutedEntries.end() &&
+                !m_reroutedEntries[p.m_alias].empty())
+            {
+                SWSS_LOG_NOTICE("EVPN MH restore: port %s is back up, restoring MACs from tunnel",
+                    p.m_alias.c_str());
+                evpnMhRestoreFromTunnel(p);
+            }
+        }
     }
     return;
+}
+
+void FdbOrch::evpnMhRerouteToTunnel(const Port& downPort)
+{
+    SWSS_LOG_ENTER();
+
+    /* Find the peer VTEP to reroute traffic to */
+    string peer_vtep = gEvpnMhOrch->getPeerVtepForEsPort(downPort.m_alias);
+    if (peer_vtep.empty())
+    {
+        SWSS_LOG_ERROR("EVPN MH failover: no peer VTEP for port %s, falling back to flush",
+            downPort.m_alias.c_str());
+        /* Fall back to normal flush behavior */
+        if (downPort.m_bridge_port_id != SAI_NULL_OBJECT_ID)
+        {
+            flushFDBEntries(downPort.m_bridge_port_id, SAI_NULL_OBJECT_ID);
+        }
+        return;
+    }
+
+    /* Get the tunnel port name for the peer VTEP */
+    VxlanTunnelOrch* tunnel_orch = gDirectory.get<VxlanTunnelOrch*>();
+    string tunnel_port_name;
+    if (tunnel_orch->isDipTunnelsSupported())
+    {
+        tunnel_port_name = tunnel_orch->getTunnelPortName(peer_vtep);
+    }
+    else
+    {
+        EvpnNvoOrch* evpn_nvo_orch = gDirectory.get<EvpnNvoOrch*>();
+        VxlanTunnel* sip_tunnel = evpn_nvo_orch->getEVPNVtep();
+        if (sip_tunnel)
+        {
+            tunnel_port_name = tunnel_orch->getTunnelPortName(
+                sip_tunnel->getSrcIP().to_string(), true);
+        }
+    }
+
+    Port tunnelPort;
+    if (tunnel_port_name.empty() || !m_portsOrch->getPort(tunnel_port_name, tunnelPort))
+    {
+        SWSS_LOG_ERROR("EVPN MH failover: tunnel port for VTEP %s not found, falling back to flush",
+            peer_vtep.c_str());
+        if (downPort.m_bridge_port_id != SAI_NULL_OBJECT_ID)
+        {
+            flushFDBEntries(downPort.m_bridge_port_id, SAI_NULL_OBJECT_ID);
+        }
+        return;
+    }
+
+    SWSS_LOG_NOTICE("EVPN MH failover: rerouting MACs from port %s to tunnel %s (VTEP %s)",
+        downPort.m_alias.c_str(), tunnel_port_name.c_str(), peer_vtep.c_str());
+
+    /* Save and reroute each FDB entry on this port */
+    vector<ReroutedFdbEntry> rerouted;
+    auto port_entries_it = m_entries_by_port.find(downPort.m_alias);
+    if (port_entries_it == m_entries_by_port.end())
+    {
+        SWSS_LOG_NOTICE("EVPN MH failover: no FDB entries on port %s", downPort.m_alias.c_str());
+        return;
+    }
+
+    /* Copy entries to avoid iterator invalidation */
+    auto fdb_list = port_entries_it->second;
+
+    for (const auto& fdbEntry : fdb_list)
+    {
+        auto entry_it = m_entries.find(fdbEntry);
+        if (entry_it == m_entries.end())
+        {
+            continue;
+        }
+
+        /* Save original entry for restore */
+        ReroutedFdbEntry saved;
+        saved.entry = fdbEntry;
+        saved.origData = entry_it->second;
+
+        /* Remove old FDB entry from SAI */
+        sai_fdb_entry_t sai_fdb_entry;
+        sai_fdb_entry.switch_id = gSwitchId;
+        memcpy(sai_fdb_entry.mac_address, fdbEntry.mac.getMac(), sizeof(sai_mac_t));
+        sai_fdb_entry.bv_id = fdbEntry.bv_id;
+
+        sai_status_t status = sai_fdb_api->remove_fdb_entry(&sai_fdb_entry);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("EVPN MH failover: failed to remove FDB entry mac=%s, status=%d",
+                fdbEntry.mac.to_string().c_str(), status);
+            continue;
+        }
+
+        /* Create new FDB entry pointing to tunnel */
+        vector<sai_attribute_t> attrs;
+        sai_attribute_t attr;
+
+        attr.id = SAI_FDB_ENTRY_ATTR_TYPE;
+        attr.value.s32 = SAI_FDB_ENTRY_TYPE_STATIC;
+        attrs.push_back(attr);
+
+        attr.id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
+        attr.value.oid = tunnelPort.m_bridge_port_id;
+        attrs.push_back(attr);
+
+        string end_point_ip = "";
+        if (!tunnel_orch->isDipTunnelsSupported())
+        {
+            attr.id = SAI_FDB_ENTRY_ATTR_ENDPOINT_IP;
+            IpAddress ip(peer_vtep);
+            sai_ip_address_t sai_ip;
+            sai_ip.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+            sai_ip.addr.ip4 = ip.getV4Addr();
+            attr.value.ipaddr = sai_ip;
+            attrs.push_back(attr);
+        }
+
+        status = sai_fdb_api->create_fdb_entry(&sai_fdb_entry, (uint32_t)attrs.size(), attrs.data());
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("EVPN MH failover: failed to create tunnel FDB entry mac=%s, status=%d",
+                fdbEntry.mac.to_string().c_str(), status);
+            continue;
+        }
+
+        SWSS_LOG_NOTICE("EVPN MH failover: rerouted mac=%s to tunnel %s",
+            fdbEntry.mac.to_string().c_str(), tunnel_port_name.c_str());
+
+        /* Update internal cache */
+        FdbData newData = entry_it->second;
+        newData.bridge_port_id = tunnelPort.m_bridge_port_id;
+        newData.origin = FDB_ORIGIN_VXLAN_ADVERTIZED;
+        newData.dest_type = VTEP;
+        newData.dest_value = peer_vtep;
+        newData.type = "static";
+
+        /* Remove from old port's entry list */
+        removeFdbEntryFromPortCache(fdbEntry, downPort);
+
+        /* Update the main entry */
+        m_entries[fdbEntry] = newData;
+
+        /* Add to tunnel port's entry list */
+        m_entries_by_port[tunnel_port_name].push_back(fdbEntry);
+
+        rerouted.push_back(saved);
+    }
+
+    m_reroutedEntries[downPort.m_alias] = std::move(rerouted);
+
+    SWSS_LOG_NOTICE("EVPN MH failover: rerouted %zu MACs from port %s to tunnel %s",
+        m_reroutedEntries[downPort.m_alias].size(),
+        downPort.m_alias.c_str(), tunnel_port_name.c_str());
+}
+
+void FdbOrch::evpnMhRestoreFromTunnel(const Port& upPort)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = m_reroutedEntries.find(upPort.m_alias);
+    if (it == m_reroutedEntries.end() || it->second.empty())
+    {
+        return;
+    }
+
+    size_t restored = 0;
+    for (const auto& rerouted : it->second)
+    {
+        /* Remove the tunnel FDB entry */
+        sai_fdb_entry_t sai_fdb_entry;
+        sai_fdb_entry.switch_id = gSwitchId;
+        memcpy(sai_fdb_entry.mac_address, rerouted.entry.mac.getMac(), sizeof(sai_mac_t));
+        sai_fdb_entry.bv_id = rerouted.entry.bv_id;
+
+        sai_status_t status = sai_fdb_api->remove_fdb_entry(&sai_fdb_entry);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("EVPN MH restore: failed to remove tunnel FDB entry mac=%s, status=%d",
+                rerouted.entry.mac.to_string().c_str(), status);
+            continue;
+        }
+
+        /* Re-create original FDB entry pointing to local port */
+        vector<sai_attribute_t> attrs;
+        sai_attribute_t attr;
+
+        attr.id = SAI_FDB_ENTRY_ATTR_TYPE;
+        attr.value.s32 = (rerouted.origData.type == "static") ?
+            SAI_FDB_ENTRY_TYPE_STATIC : SAI_FDB_ENTRY_TYPE_DYNAMIC;
+        attrs.push_back(attr);
+
+        attr.id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
+        attr.value.oid = upPort.m_bridge_port_id;
+        attrs.push_back(attr);
+
+        status = sai_fdb_api->create_fdb_entry(&sai_fdb_entry, (uint32_t)attrs.size(), attrs.data());
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("EVPN MH restore: failed to restore FDB entry mac=%s, status=%d",
+                rerouted.entry.mac.to_string().c_str(), status);
+            continue;
+        }
+
+        /* Update internal cache back to original */
+        m_entries[rerouted.entry] = rerouted.origData;
+        m_entries[rerouted.entry].bridge_port_id = upPort.m_bridge_port_id;
+        m_entries_by_port[upPort.m_alias].push_back(rerouted.entry);
+        restored++;
+
+        SWSS_LOG_NOTICE("EVPN MH restore: restored mac=%s to port %s",
+            rerouted.entry.mac.to_string().c_str(), upPort.m_alias.c_str());
+    }
+
+    SWSS_LOG_NOTICE("EVPN MH restore: restored %zu/%zu MACs to port %s",
+        restored, it->second.size(), upPort.m_alias.c_str());
+
+    m_reroutedEntries.erase(it);
 }
 
 void FdbOrch::updateVlanMember(const VlanMemberUpdate& update)
