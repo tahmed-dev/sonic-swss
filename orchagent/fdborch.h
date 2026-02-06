@@ -4,6 +4,7 @@
 #include "orch.h"
 #include "observer.h"
 #include "portsorch.h"
+#include "evpnmhorch.h"
 
 enum FdbOrigin
 {
@@ -67,6 +68,7 @@ struct FdbData
     */
     bool is_flush_pending;
 
+    /* Remote FDB related info */
     NEXT_HOP_VALUE_TYPE dest_type;
     string dest_value;
     string    esi;
@@ -161,6 +163,18 @@ private:
                                const sai_fdb_entry_type_t&);
 
     bool isDestinationSame(FdbData &oldFdbData, FdbData &newFdbData);
+
+    /* EVPN MH failover: reroute MACs to VxLAN tunnel on ES port-down */
+    void evpnMhRerouteToTunnel(const Port& downPort);
+    void evpnMhRestoreFromTunnel(const Port& upPort);
+
+    /* Cache of FDB entries rerouted during ES port failover.
+     * Key: port alias, Value: vector of {FdbEntry, original FdbData} */
+    struct ReroutedFdbEntry {
+        FdbEntry entry;
+        FdbData  origData;
+    };
+    unordered_map<string, vector<ReroutedFdbEntry>> m_reroutedEntries;
 };
 
 #endif /* SWSS_FDBORCH_H */
