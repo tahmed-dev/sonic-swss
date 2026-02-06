@@ -1196,14 +1196,46 @@ bool IntfsOrch::addRouterIntfs(sai_object_id_t vrf_id, Port &port, string loopba
     }
 
     attr.id = SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS;
-    if (port.m_mac)
     {
-        memcpy(attr.value.mac, port.m_mac.getMac(), sizeof(sai_mac_t));
-    }
-    else
-    {
-        memcpy(attr.value.mac, gMacAddress.getMac(), sizeof(sai_mac_t));
-
+        bool anycast_mac_set = false;
+        /* For VLAN RIFs, check if anycast_gateway_mac is configured in DEVICE_METADATA.
+         * This is used in EVPN MH to ensure all T1 leaves share the same gateway MAC. */
+        if (port.m_type == Port::VLAN)
+        {
+            try
+            {
+                swss::DBConnector cfgDb("CONFIG_DB", 0);
+                std::string anycast_mac_str;
+                auto ret = cfgDb.hget("DEVICE_METADATA|localhost", "anycast_gateway_mac");
+                if (ret)
+                {
+                    anycast_mac_str = *ret;
+                    if (!anycast_mac_str.empty())
+                    {
+                        MacAddress anycast_mac(anycast_mac_str);
+                        memcpy(attr.value.mac, anycast_mac.getMac(), sizeof(sai_mac_t));
+                        anycast_mac_set = true;
+                        SWSS_LOG_NOTICE("Using anycast gateway MAC %s for VLAN RIF %s",
+                                        anycast_mac_str.c_str(), port.m_alias.c_str());
+                    }
+                }
+            }
+            catch (const std::exception &e)
+            {
+                SWSS_LOG_WARN("Failed to read anycast_gateway_mac: %s", e.what());
+            }
+        }
+        if (!anycast_mac_set)
+        {
+            if (port.m_mac)
+            {
+                memcpy(attr.value.mac, port.m_mac.getMac(), sizeof(sai_mac_t));
+            }
+            else
+            {
+                memcpy(attr.value.mac, gMacAddress.getMac(), sizeof(sai_mac_t));
+            }
+        }
     }
     attrs.push_back(attr);
 

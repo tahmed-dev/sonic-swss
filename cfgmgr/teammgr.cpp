@@ -306,7 +306,7 @@ void TeamMgr::doLagTask(Consumer &consumer)
 
             if (m_lagList.find(alias) == m_lagList.end())
             {
-                if (addLag(alias, min_links, fallback, fast_rate) == task_need_retry)
+                if (addLag(alias, min_links, fallback, fast_rate, sys_mac) == task_need_retry)
                 {
                     // If LAG creation fails, we need to clean up any potentially orphaned teamd processes
                     removeLag(alias);
@@ -658,7 +658,7 @@ bool TeamMgr::setLagSysmac(const string &alias, string &sys_mac)
     return true;
 }
 
-task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fallback, bool fast_rate)
+task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fallback, bool fast_rate, const string &system_mac)
 {
     SWSS_LOG_ENTER();
 
@@ -670,32 +670,41 @@ task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fal
     const string dump_path = "/var/warmboot/teamd/";
     MacAddress mac_boot = m_mac;
 
+    // If system_mac is configured (e.g. for EVPN MH), use it as the
+    // device hwaddr so teamd starts with the correct LACP actor system ID.
+    if (!system_mac.empty() && system_mac != "None")
+    {
+        mac_boot = MacAddress(system_mac);
+    }
     // set portchannel mac same with mac before warmStart, when warmStart and there
     // is a file written by teamd.
-    ifstream aliasfile(dump_path + alias);
-    if (WarmStart::isWarmStart() && aliasfile.is_open())
+    else
     {
-        const int partner_system_id_offset = 40;
-        string line;
-
-        while (getline(aliasfile, line))
+        ifstream aliasfile(dump_path + alias);
+        if (WarmStart::isWarmStart() && aliasfile.is_open())
         {
-            ifstream memberfile(dump_path + line, ios::binary);
-            uint8_t mac_temp[ETHER_ADDR_LEN] = {0};
-            uint8_t null_mac[ETHER_ADDR_LEN] = {0};
+            const int partner_system_id_offset = 40;
+            string line;
 
-            if (!memberfile.is_open())
-                continue;
+            while (getline(aliasfile, line))
+            {
+                ifstream memberfile(dump_path + line, ios::binary);
+                uint8_t mac_temp[ETHER_ADDR_LEN] = {0};
+                uint8_t null_mac[ETHER_ADDR_LEN] = {0};
 
-            memberfile.seekg(partner_system_id_offset, std::ios::beg);
-            memberfile.read(reinterpret_cast<char*>(mac_temp), ETHER_ADDR_LEN);
+                if (!memberfile.is_open())
+                    continue;
 
-            /* During negotiation stage partner info of pdu is empty , skip it */
-            if (memcmp(mac_temp, null_mac, ETHER_ADDR_LEN) == 0)
-                continue;
+                memberfile.seekg(partner_system_id_offset, std::ios::beg);
+                memberfile.read(reinterpret_cast<char*>(mac_temp), ETHER_ADDR_LEN);
 
-            mac_boot = MacAddress(mac_temp);
-            break;
+                /* During negotiation stage partner info of pdu is empty , skip it */
+                if (memcmp(mac_temp, null_mac, ETHER_ADDR_LEN) == 0)
+                    continue;
+
+                mac_boot = MacAddress(mac_temp);
+                break;
+            }
         }
     }
 
@@ -718,6 +727,14 @@ task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fal
     if (fast_rate)
     {
         conf << ",\"fast_rate\":true";
+    }
+
+    // Set LACP actor system address for EVPN MH Ethernet Segments.
+    // All T1 leaves sharing an ES must present the same sys_addr so
+    // the remote server aggregates links from both into one LAG.
+    if (!system_mac.empty() && system_mac != "None")
+    {
+        conf << ",\"sys_addr\":\"" << system_mac << "\"";
     }
 
     conf << "}}'";

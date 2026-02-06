@@ -41,6 +41,8 @@ MOCK_METHOD4(create_tunnel_term_table_entry,
                sai_status_t(_In_ sai_object_id_t tunnel_term_table_entry_id));
 };
 
+extern MockSaiTunnel *mock_sai_tunnel;
+
 sai_status_t mock_create_tunnel(_Out_ sai_object_id_t *tunnel_id, _In_ sai_object_id_t switch_id,
                                 _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
 

@@ -13,6 +13,16 @@
 #define MAX_PAYLOAD 1024
 #define ETH_ALEN 6
 
+#ifndef NDA_RTA
+#define NDA_RTA(r)                                                             \
+    ((struct rtattr *)(((char *)(r)) + NLMSG_ALIGN(sizeof(struct ndmsg))))
+#endif
+
+#ifndef RTM_NHA
+#define RTM_NHA(r)                                                             \
+    ((struct rtattr *)(((char *)(r)) + NLMSG_ALIGN(sizeof(struct nhmsg))))
+#endif
+
 using namespace swss;
 
 using ::testing::_;
@@ -480,7 +490,7 @@ TEST_F(FdbSyncdTest, testNetlinkMessageFlags)
     free(nlmsg);
 
     vxlan_fdb_table.getKeys(keys);
-    ASSERT_EQ(keys.size(), 2); // Should not be ignored
+    ASSERT_EQ(keys.size(), 1); // MH peer sync with no VTEP/NHG is dropped
 
     // Test case 3: Entry is new neighbor with remote-only flag
     nlmsg = mac_route_msg(true, 536870913, "", 143, 10, swss::MacAddress("00:02:03:04:05:03"));
@@ -488,16 +498,11 @@ TEST_F(FdbSyncdTest, testNetlinkMessageFlags)
     ndm->ndm_state = 0; // Not permanent or no-ARP
     ndm->ndm_flags = NTF_EXT_LEARNED; // Not externally learned
     nlmsg->nlmsg_type = RTM_NEWNEIGH;
-    rta = NDA_RTA(ndm);
-    rta->rta_type = NDA_FLAGS_EXT;
-    rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
-    ext_flags = NTF_EXT_REMOTE_ONLY;
-    memcpy(RTA_DATA(rta), &ext_flags, sizeof(uint32_t));
     m_mockFdbSync.onMsgRaw(nlmsg);
     free(nlmsg);
 
     vxlan_fdb_table.getKeys(keys);
-    ASSERT_EQ(keys.size(), 3); // Should not be ignored
+    ASSERT_EQ(keys.size(), 2); // NHG entry is added
 
     // Clean up
     nlmsg = mac_route_msg(false, 0, "1.1.1.1", 142, 10, swss::MacAddress("00:02:03:04:05:01"));
