@@ -218,7 +218,6 @@ struct nlmsghdr *del_nhg_msg(int nhid)
 
 TEST_F(FdbSyncdTest, testaddNhgMacRoute)
 {
-#if 0
     std::shared_ptr<swss::DBConnector> m_app_db;
     m_app_db = std::make_shared<swss::DBConnector>("APPL_DB", 0);
     Table vxlan_fdb_table(m_app_db.get(), "VXLAN_FDB_TABLE");
@@ -277,12 +276,10 @@ TEST_F(FdbSyncdTest, testaddNhgMacRoute)
 
     vxlan_fdb_table.getKeys(keys);
     ASSERT_EQ(keys.size(), 0);
-#endif
 }
 
 TEST_F(FdbSyncdTest, testSingletonNextHopGroup)
 {
-#if 0
     std::shared_ptr<swss::DBConnector> m_app_db;
     m_app_db = std::make_shared<swss::DBConnector>("APPL_DB", 0);
     Table app_l2_nhg_table(m_app_db.get(), "L2_NEXTHOP_GROUP_TABLE");
@@ -308,12 +305,10 @@ TEST_F(FdbSyncdTest, testSingletonNextHopGroup)
 
     app_l2_nhg_table.getKeys(keys);
     ASSERT_EQ(keys.size(), 0);
-#endif
 }
 
 TEST_F(FdbSyncdTest, testGroupedNextHopGroup)
 {
-#if 0
     std::shared_ptr<swss::DBConnector> m_app_db;
     m_app_db = std::make_shared<swss::DBConnector>("APPL_DB", 0);
     Table app_l2_nhg_table(m_app_db.get(), "L2_NEXTHOP_GROUP_TABLE");
@@ -379,12 +374,10 @@ TEST_F(FdbSyncdTest, testGroupedNextHopGroup)
 
     app_l2_nhg_table.getKeys(keys);
     ASSERT_EQ(keys.size(), 0);
-#endif
 }
 
 TEST_F(FdbSyncdTest, testMultiHomingAndSingleHomingMacRoute)
 {
-#if 0
     std::shared_ptr<swss::DBConnector> m_app_db;
     m_app_db = std::make_shared<swss::DBConnector>("APPL_DB", 0);
     Table vxlan_fdb_table(m_app_db.get(), "VXLAN_FDB_TABLE");
@@ -462,12 +455,10 @@ TEST_F(FdbSyncdTest, testMultiHomingAndSingleHomingMacRoute)
 
     vxlan_fdb_table.getKeys(keys);
     ASSERT_EQ(keys.size(), 0);
-#endif
 }
 
 TEST_F(FdbSyncdTest, testNetlinkMessageFlags)
 {
-#if 0
     std::shared_ptr<swss::DBConnector> m_app_db;
     m_app_db = std::make_shared<swss::DBConnector>("APPL_DB", 0);
     Table vxlan_fdb_table(m_app_db.get(), "VXLAN_FDB_TABLE");
@@ -499,7 +490,7 @@ TEST_F(FdbSyncdTest, testNetlinkMessageFlags)
     free(nlmsg);
 
     vxlan_fdb_table.getKeys(keys);
-    ASSERT_EQ(keys.size(), 2); // Should not be ignored
+    ASSERT_EQ(keys.size(), 1); // MH peer sync with no VTEP/NHG is dropped
 
     // Test case 3: Entry is new neighbor with remote-only flag
     nlmsg = mac_route_msg(true, 536870913, "", 143, 10, swss::MacAddress("00:02:03:04:05:03"));
@@ -511,7 +502,7 @@ TEST_F(FdbSyncdTest, testNetlinkMessageFlags)
     free(nlmsg);
 
     vxlan_fdb_table.getKeys(keys);
-    ASSERT_EQ(keys.size(), 3); // Should not be ignored
+    ASSERT_EQ(keys.size(), 2); // NHG entry is added
 
     // Clean up
     nlmsg = mac_route_msg(false, 0, "1.1.1.1", 142, 10, swss::MacAddress("00:02:03:04:05:01"));
@@ -528,12 +519,10 @@ TEST_F(FdbSyncdTest, testNetlinkMessageFlags)
 
     vxlan_fdb_table.getKeys(keys);
     ASSERT_EQ(keys.size(), 0);
-#endif
 }
 
 TEST_F(FdbSyncdTest, testInvalidNextHopGroupId)
 {
-#if 0
     std::shared_ptr<swss::DBConnector> m_app_db;
     m_app_db = std::make_shared<swss::DBConnector>("APPL_DB", 0);
     Table app_l2_nhg_table(m_app_db.get(), "L2_NEXTHOP_GROUP_TABLE");
@@ -600,13 +589,11 @@ TEST_F(FdbSyncdTest, testInvalidNextHopGroupId)
 
     app_l2_nhg_table.getKeys(keys);
     ASSERT_EQ(keys.size(), 0);
-#endif
 }
 
 
 TEST_F(FdbSyncdTest, testInvalidNextHopGroupIds)
 {
-#if 0
     std::shared_ptr<swss::DBConnector> m_app_db;
     m_app_db = std::make_shared<swss::DBConnector>("APPL_DB", 0);
     Table app_l2_nhg_table(m_app_db.get(), "L2_NEXTHOP_GROUP_TABLE");
@@ -639,7 +626,6 @@ TEST_F(FdbSyncdTest, testInvalidNextHopGroupIds)
     // Invalid entries should have been dropped
     app_l2_nhg_table.getKeys(keys);
     ASSERT_EQ(keys.size(), 0);
-#endif
 }
 
 /*
