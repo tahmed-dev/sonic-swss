@@ -1,3 +1,6 @@
+// NOTE: Using #define private public is a known SONiC test pattern to access internal members
+// for testing purposes. However, this is technically undefined behavior in C++ and should be
+// used cautiously. Consider using friend declarations or proper test fixtures in new code.
 #define private public // make Directory::m_values available to clean it.
 #include "directory.h"
 #undef private
@@ -32,9 +35,9 @@ namespace evpnmhorch_test
         shared_ptr<swss::DBConnector> m_state_db;
         shared_ptr<swss::DBConnector> m_chassis_app_db;
 
-        FlexCounterOrch *m_FlexCounterOrch;
+        FlexCounterOrch *m_FlexCounterOrch = nullptr;
         sai_vlan_api_t ut_sai_vlan_api;
-        sai_vlan_api_t *org_sai_vlan_api;
+        sai_vlan_api_t *org_sai_vlan_api = nullptr;
 
         void _hook_sai_vlan_api()
         {
