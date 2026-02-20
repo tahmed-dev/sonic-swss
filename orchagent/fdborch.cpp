@@ -527,6 +527,18 @@ void FdbOrch::update(sai_fdb_event_t        type,
         }
 
         storeFdbEntryState(update);
+
+        /* Track in m_entries_by_port for EVPN MH reroute lookups.
+         * storeFdbEntryState only updates m_entries; we need the port
+         * index so evpnMhRerouteToTunnel can find MACs on a downed port. */
+        {
+            auto &port_fdb_list = m_entries_by_port[update.port.m_alias];
+            if (std::find(port_fdb_list.begin(), port_fdb_list.end(), update.entry) == port_fdb_list.end())
+            {
+                port_fdb_list.push_back(update.entry);
+            }
+        }
+
         notify(SUBJECT_TYPE_FDB_CHANGE, &update);
         if (mac_move_local)
         {
@@ -718,6 +730,9 @@ void FdbOrch::update(sai_fdb_event_t        type,
             m_portsOrch->setPort(vlan.m_alias, vlan);
         }
         storeFdbEntryState(update);
+
+        /* Remove from m_entries_by_port for EVPN MH consistency */
+        removeFdbEntryFromPortCache(update.entry, update.port);
 
         /* Remove local neighbor entry if exists
          */
