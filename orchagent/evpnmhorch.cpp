@@ -1,8 +1,14 @@
 #include "evpnmhorch.h"
 
 #include "portsorch.h"
+#include "directory.h"
+#include "vxlanorch.h"
+#include "schema.h"
+#include "dbconnector.h"
+#include "table.h"
 
 extern PortsOrch *gPortsOrch;
+extern Directory<Orch*> gDirectory;
 
 extern sai_vlan_api_t *sai_vlan_api;
 
@@ -321,4 +327,39 @@ bool EvpnMhOrch::isPortAndVlanAssociatedToEs(const std::string port_name, const 
 bool EvpnMhOrch::isPortInterfaceAssociatedToEs(const std::string port_name)
 {
     return (m_esIntfMap.find(port_name) != m_esIntfMap.end());
+}
+
+std::string EvpnMhOrch::getPeerVtepForEsPort(const std::string &port_name)
+{
+    /*
+     * For Phase 1 PoC: Return the first remote VTEP from VXLAN_REMOTE_VNI table.
+     * In a full implementation, this would look up the ES membership to find
+     * which specific peer VTEPs share the same Ethernet Segment.
+     *
+     * The VXLAN_REMOTE_VNI table is populated by fdbsyncd when it receives
+     * EVPN Type-3 IMET routes from peer VTEPs.
+     * Key format: VXLAN_REMOTE_VNI_TABLE:<vlan>:<remote_vtep_ip>
+     */
+    try {
+        swss::DBConnector appDb("APPL_DB", 0);
+        auto keys = appDb.keys("VXLAN_REMOTE_VNI_TABLE:*");
+
+        for (const auto &key : keys)
+        {
+            /* Extract remote VTEP IP from key: VXLAN_REMOTE_VNI_TABLE:Vlan10:10.1.0.4 */
+            auto lastColon = key.rfind(':');
+            if (lastColon != std::string::npos)
+            {
+                std::string vtep_ip = key.substr(lastColon + 1);
+                SWSS_LOG_NOTICE("getPeerVtepForEsPort: port=%s peer_vtep=%s",
+                    port_name.c_str(), vtep_ip.c_str());
+                return vtep_ip;
+            }
+        }
+    } catch (const std::exception &e) {
+        SWSS_LOG_ERROR("getPeerVtepForEsPort: exception: %s", e.what());
+    }
+
+    SWSS_LOG_NOTICE("getPeerVtepForEsPort: no peer VTEP found for port %s", port_name.c_str());
+    return "";
 }

@@ -34,6 +34,10 @@ public:
     bool isPortAndVlanAssociatedToEs(const std::string port_name, const sai_vlan_id_t vlan_id);
     bool isInterfaceDF(const std::string port_name, const sai_vlan_id_t vlan_id);
 
+    /* Get all peer VTEP IPs for a given ES port (from EVPN Type-3 routes).
+     * Returns the peer VTEP to reroute traffic to on local link failure. */
+    std::string getPeerVtepForEsPort(const std::string &port_name);
+
 private:
     vector<Table *> m_appTables;
 
