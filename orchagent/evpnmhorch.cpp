@@ -245,6 +245,14 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
 
         SWSS_LOG_NOTICE("doEvpnEsIntfTask: %s oper: ESI intf: %s", op.c_str(), key.c_str());
 
+        if (!vlanMembersApplyNonDF(key))
+        {
+            // SAI operation failed, leave in m_toSync for retry
+            // Do not modify m_esIntfMap until operation succeeds
+            ++it;
+            continue;
+        }
+
         if (op == SET_COMMAND)
         {
             /* Always register ES membership immediately so that portsOrch
@@ -260,6 +268,7 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
             m_esIntfMap.erase(key);
             vlanMembersApplyNonDF(key);  /* reset existing members */
         }
+
         it = consumer.m_toSync.erase(it);
     }
 }
