@@ -245,14 +245,6 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
 
         SWSS_LOG_NOTICE("doEvpnEsIntfTask: %s oper: ESI intf: %s", op.c_str(), key.c_str());
 
-        if (!vlanMembersApplyNonDF(key))
-        {
-            // SAI operation failed, leave in m_toSync for retry
-            // Do not modify m_esIntfMap until operation succeeds
-            ++it;
-            continue;
-        }
-
         if (op == SET_COMMAND)
         {
             /* Always register ES membership immediately so that portsOrch
@@ -261,7 +253,13 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
              * members exist yet, they will pick up the DF state during
              * creation via isPortInterfaceAssociatedToEs(). */
             m_esIntfMap[key] = true;
-            vlanMembersApplyNonDF(key);  /* best-effort on existing members */
+            if (!vlanMembersApplyNonDF(key))
+            {
+                // SAI operation failed — ES is registered but DF state
+                // not applied.  Leave in m_toSync for retry.
+                ++it;
+                continue;
+            }
         }
         else if (op == DEL_COMMAND)
         {
