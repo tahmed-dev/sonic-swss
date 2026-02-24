@@ -491,6 +491,7 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
 
     SWSS_LOG_INFO("Create vxlan tunnel map %s", vxlanTunnelMapName.c_str());
     std::string vlan, vlan_id, vni_id, src_ip, dst_ip("");
+    bool is_l3_map = false;
     for (auto i : kfvFieldsValues(t))
     {
         const std::string & field = fvField(i);
@@ -503,6 +504,17 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
         {
             vni_id = value;
         }
+        else if (field == "vrf")
+        {
+            is_l3_map = true;
+        }
+    }
+
+    /* L3 VNI map entries (vrf-based) are handled by VxlanOrch/VRFOrch, not vxlanmgrd */
+    if (is_l3_map || vlan.empty())
+    {
+        SWSS_LOG_NOTICE("Skipping L3 VNI map entry: %s", vxlanTunnelMapName.c_str());
+        return true;
     }
 
     // Check for VLAN or VNI if they are already mapped
@@ -1200,6 +1212,14 @@ void VxlanMgr::restoreVxlanNetDevices()
         }
         const auto vlan_prefix = std::string("Vlan");
         const auto prefix_len = vlan_prefix.length();
+
+        /* Skip L3 VNI map entries */
+        if (vlan.empty() || vlan.substr(0, prefix_len) != vlan_prefix)
+        {
+            SWSS_LOG_NOTICE("RESTORE: Skipping L3 VNI map entry: %s", vxlanTunnelMapName.c_str());
+            continue;
+        }
+
         vlan_id = vlan.substr(prefix_len);
 
         size_t found = vxlanTunnelMapName.find(delimiter);

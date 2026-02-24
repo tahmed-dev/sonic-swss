@@ -169,6 +169,11 @@ public:
     }
 
     int updateL3VniVlan(uint32_t vni, uint16_t vlan_id);
+
+    /* Called by EvpnNvoOrch after VTEP is ready, to retry VNI mappings
+     * that failed during initial VRF processing */
+    void retryPendingVniMaps();
+
 private:
     virtual bool addOperation(const Request& request);
     virtual bool delOperation(const Request& request);
@@ -181,6 +186,9 @@ private:
     VRFNameVNIMapTable vrf_vni_map_table_;
     swss::Table m_stateVrfObjectTable;
     L3VNITable l3vni_table_;
+
+    /* Pending VRF→VNI mappings that failed because EVPN VTEP wasn't ready */
+    std::map<std::string, uint32_t> m_pendingVniMaps;
 };
 
 #endif // __VRFORCH_H

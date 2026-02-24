@@ -21,6 +21,7 @@ extern "C" {
 #include "flex_counter_manager.h"
 #include "converter.h"
 #include "saihelper.h"
+#include "vrforch.h"
 
 /* Global variables */
 extern sai_object_id_t gSwitchId;
@@ -2807,7 +2808,16 @@ bool EvpnNvoOrch::addOperation(const Request& request)
 
     source_vtep_ptr = tunnel_orch->getVxlanTunnel(vtep_name);
 
-    SWSS_LOG_INFO("evpnnvo: %s vtep : %s \n",nvo_name.c_str(), vtep_name.c_str());
+    SWSS_LOG_NOTICE("EvpnNvoOrch: %s vtep: %s — VTEP ptr %s",
+        nvo_name.c_str(), vtep_name.c_str(),
+        source_vtep_ptr ? "set" : "NULL");
+
+    /* Retry any VRF VNI mappings that were deferred because VTEP wasn't ready */
+    if (source_vtep_ptr)
+    {
+        VRFOrch* vrf_orch = gDirectory.get<VRFOrch*>();
+        vrf_orch->retryPendingVniMaps();
+    }
 
     return true;
 }

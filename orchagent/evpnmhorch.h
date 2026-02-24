@@ -2,9 +2,18 @@
 #define SWSS_EVPNMHORCH_H
 
 #include <vector>
+#include <map>
 
 #include "orch.h"
 #include "observer.h"
+#include "ipprefix.h"
+
+/* Failover mode for EVPN MH Ethernet Segments */
+enum class EvpnMhFailoverMode {
+    L2,        // MAC reroute to L2 VxLAN tunnel
+    L3,        // Host route injection via L3 VxLAN tunnel
+    AUTO       // L3 if L3VNI available, else L2
+};
 
 struct EsCacheEntry
 {
@@ -38,9 +47,41 @@ public:
      * Returns the peer VTEP to reroute traffic to on local link failure. */
     std::string getPeerVtepForEsPort(const std::string &port_name);
 
+    /* L3 dual-mode failover support */
+    EvpnMhFailoverMode getEffectiveFailoverMode(const std::string &port_alias);
+    sai_object_id_t getVrfOidForEsPort(const std::string &port_alias);
+    sai_object_id_t getL3TunnelNexthop(const std::string &peer_vtep_ip);
+
+    /* Sister T1 peer VTEP */
+    std::string getPeerVtepForEsPortConfig(const std::string &port_name);
+    void initPeerState();
+
+    /* Server IPs behind an ES port (from ConfigDB) */
+    std::vector<IpPrefix> getServerIpsForEsPort(const std::string &port_name);
+
+    /* Check if the peer VTEP still has the ES active (via FRR zebra) */
+    bool isPeerEsActive(const std::string &port_name);
+
 private:
     std::map<std::string, struct EsCacheEntry *> m_esDataMap;
     std::map<std::string, bool> m_esIntfMap;
+
+    /* Per-port failover mode from EVPN_ETHERNET_SEGMENT table */
+    std::map<std::string, EvpnMhFailoverMode> m_esFailoverMode;
+
+    /* Per-ES peer VTEP IP (sister T1) from config — enables pre-provisioning
+     * of tunnels, arp-term entries, and L3 nexthops at init time */
+    std::map<std::string, std::string> m_esPeerVtep;
+
+    /* Per-ES server IPs from config — static mapping of port → server overlay IPs
+     * for L3 failover host route injection (avoids dependency on FDB/neighbor table) */
+    std::map<std::string, std::vector<IpPrefix>> m_esServerIps;
+
+    /* Cache of L3 VxLAN tunnel nexthops: peer_vtep_ip → SAI nexthop OID */
+    std::map<std::string, sai_object_id_t> m_l3TunnelNexthops;
+
+    /* Whether peer state has been initialized */
+    bool m_peerStateInitDone = false;
 
     struct EsCacheEntry *getEsCache(const std::string &key);
     struct EsCacheEntry *getEsCacheForPort(const std::string &key);

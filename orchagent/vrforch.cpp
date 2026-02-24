@@ -225,7 +225,9 @@ bool VRFOrch::updateVrfVNIMap(const std::string& vrf_name, uint32_t vni)
             auto evpn_vtep_ptr = evpn_orch->getEVPNVtep();
             if(!evpn_vtep_ptr)
             {
-                SWSS_LOG_NOTICE("updateVrfVNIMap unable to find EVPN VTEP");
+                SWSS_LOG_NOTICE("updateVrfVNIMap: EVPN VTEP not ready, deferring VRF %s VNI %u",
+                    vrf_name.c_str(), vni);
+                m_pendingVniMaps[vrf_name] = vni;
                 return false;
             }
 
@@ -286,4 +288,30 @@ int VRFOrch::updateL3VniVlan(uint32_t vni, uint16_t vlan_id)
     SWSS_LOG_INFO("updateL3VniStatus vni %d vlan %d, status %d", vni, vlan_id, status);
 
     return 0;
+}
+
+void VRFOrch::retryPendingVniMaps()
+{
+    if (m_pendingVniMaps.empty())
+        return;
+
+    SWSS_LOG_NOTICE("VRFOrch: retrying %zu pending VNI maps after EVPN VTEP ready",
+        m_pendingVniMaps.size());
+
+    auto pending = m_pendingVniMaps;
+    m_pendingVniMaps.clear();
+
+    for (const auto &entry : pending)
+    {
+        if (updateVrfVNIMap(entry.first, entry.second))
+        {
+            SWSS_LOG_NOTICE("VRFOrch: deferred VNI map succeeded for VRF %s VNI %u",
+                entry.first.c_str(), entry.second);
+        }
+        else
+        {
+            SWSS_LOG_WARN("VRFOrch: deferred VNI map still failed for VRF %s VNI %u",
+                entry.first.c_str(), entry.second);
+        }
+    }
 }
