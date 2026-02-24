@@ -16,8 +16,11 @@
 #include "directory.h"
 #include "neighorch.h"
 #include "evpnmhorch.h"
+#include "swssnet.h"
+#include "vrforch.h"
 
 extern sai_fdb_api_t    *sai_fdb_api;
+extern sai_route_api_t  *sai_route_api;
 
 extern sai_object_id_t  gSwitchId;
 extern CrmOrch *        gCrmOrch;
@@ -1640,9 +1643,19 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
          * tunnel instead of flushing them. This provides fast failover. */
         if (gEvpnMhOrch && gEvpnMhOrch->isPortInterfaceAssociatedToEs(p.m_alias))
         {
-            SWSS_LOG_NOTICE("EVPN MH failover: port %s is ES member, rerouting to tunnel",
-                p.m_alias.c_str());
-            evpnMhRerouteToTunnel(p);
+            auto mode = gEvpnMhOrch->getEffectiveFailoverMode(p.m_alias);
+            if (mode == EvpnMhFailoverMode::L3)
+            {
+                SWSS_LOG_NOTICE("EVPN MH L3 failover: port %s is ES member, injecting host routes",
+                    p.m_alias.c_str());
+                evpnMhInjectHostRoutes(p.m_alias);
+            }
+            else
+            {
+                SWSS_LOG_NOTICE("EVPN MH L2 failover: port %s is ES member, rerouting to tunnel",
+                    p.m_alias.c_str());
+                evpnMhRerouteToTunnel(p);
+            }
             return;
         }
 
@@ -1675,10 +1688,20 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
          * back to the local port from the VxLAN tunnel. */
         if (gEvpnMhOrch && gEvpnMhOrch->isPortInterfaceAssociatedToEs(p.m_alias))
         {
+            /* Withdraw L3 host routes if any were injected */
+            if (m_l3ReroutedEntries.find(p.m_alias) != m_l3ReroutedEntries.end() &&
+                !m_l3ReroutedEntries[p.m_alias].empty())
+            {
+                SWSS_LOG_NOTICE("EVPN MH L3 restore: port %s is back up, withdrawing host routes",
+                    p.m_alias.c_str());
+                evpnMhWithdrawHostRoutes(p.m_alias);
+            }
+
+            /* Restore L2 rerouted MACs if any */
             if (m_reroutedEntries.find(p.m_alias) != m_reroutedEntries.end() &&
                 !m_reroutedEntries[p.m_alias].empty())
             {
-                SWSS_LOG_NOTICE("EVPN MH restore: port %s is back up, restoring MACs from tunnel",
+                SWSS_LOG_NOTICE("EVPN MH L2 restore: port %s is back up, restoring MACs from tunnel",
                     p.m_alias.c_str());
                 evpnMhRestoreFromTunnel(p);
             }
@@ -1692,7 +1715,7 @@ void FdbOrch::evpnMhRerouteToTunnel(const Port& downPort)
     SWSS_LOG_ENTER();
 
     /* Find the peer VTEP to reroute traffic to */
-    string peer_vtep = gEvpnMhOrch->getPeerVtepForEsPort(downPort.m_alias);
+    string peer_vtep = gEvpnMhOrch->getPeerVtepForEsPortConfig(downPort.m_alias);
     if (peer_vtep.empty())
     {
         SWSS_LOG_ERROR("EVPN MH failover: no peer VTEP for port %s, falling back to flush",
@@ -2644,4 +2667,234 @@ void FdbOrch::notifyTunnelOrch(Port& port)
 
     SWSS_LOG_NOTICE("Try to delete tunnel port %s",port.m_alias.c_str());
     tunnel_orch->deleteTunnelPort(port);
+}
+
+/*
+ * EVPN MH L3 failover: inject /32 host routes for neighbors on the failed port,
+ * pointing at the L3 VxLAN tunnel nexthop to the peer VTEP.
+ */
+void FdbOrch::evpnMhInjectHostRoutes(const string &port_alias)
+{
+    SWSS_LOG_ENTER();
+
+    string peer_vtep = gEvpnMhOrch->getPeerVtepForEsPortConfig(port_alias);
+    if (peer_vtep.empty())
+    {
+        SWSS_LOG_ERROR("EVPN MH L3 failover: no peer VTEP for port %s, falling back to L2",
+            port_alias.c_str());
+        Port p;
+        if (m_portsOrch->getPort(port_alias, p))
+        {
+            evpnMhRerouteToTunnel(p);
+        }
+        return;
+    }
+
+    sai_object_id_t tunnel_nh = gEvpnMhOrch->getL3TunnelNexthop(peer_vtep);
+    if (tunnel_nh == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_ERROR("EVPN MH L3 failover: failed to get tunnel nexthop for %s, falling back to L2",
+            peer_vtep.c_str());
+        Port p;
+        if (m_portsOrch->getPort(port_alias, p))
+        {
+            evpnMhRerouteToTunnel(p);
+        }
+        return;
+    }
+
+    sai_object_id_t vrf_oid = gEvpnMhOrch->getVrfOidForEsPort(port_alias);
+    if (vrf_oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_ERROR("EVPN MH L3 failover: no VRF for port %s, falling back to L2",
+            port_alias.c_str());
+        Port p;
+        if (m_portsOrch->getPort(port_alias, p))
+        {
+            evpnMhRerouteToTunnel(p);
+        }
+        return;
+    }
+
+    auto neighbors = getNeighborsOnPort(port_alias);
+    if (neighbors.empty())
+    {
+        SWSS_LOG_NOTICE("EVPN MH L3 failover: no neighbors on port %s, falling back to L2",
+            port_alias.c_str());
+        Port p;
+        if (m_portsOrch->getPort(port_alias, p))
+        {
+            evpnMhRerouteToTunnel(p);
+        }
+        return;
+    }
+
+    SWSS_LOG_NOTICE("EVPN MH L3 failover: injecting %zu host routes for port %s via VTEP %s",
+        neighbors.size(), port_alias.c_str(), peer_vtep.c_str());
+
+    vector<L3ReroutedEntry> rerouted;
+
+    for (const auto &nbr : neighbors)
+    {
+        const auto &ip = nbr.first;
+        IpPrefix host_prefix(ip.to_string() + (ip.isV4() ? "/32" : "/128"));
+
+        sai_route_entry_t route_entry;
+        route_entry.switch_id = gSwitchId;
+        route_entry.vr_id = vrf_oid;
+        copy(route_entry.destination, host_prefix);
+
+        auto pfx_str = host_prefix.to_string();
+
+        sai_attribute_t attr;
+        attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+        attr.value.oid = tunnel_nh;
+
+        sai_status_t status = sai_route_api->create_route_entry(&route_entry, 1, &attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("EVPN MH L3 failover: failed to create route for %s, status %d",
+                pfx_str.c_str(), status);
+            continue;
+        }
+
+        SWSS_LOG_NOTICE("EVPN MH L3 failover: injected route %s → tunnel NH 0x%" PRIx64,
+            pfx_str.c_str(), tunnel_nh);
+
+        L3ReroutedEntry rentry;
+        rentry.prefix = host_prefix;
+        rentry.vrf_oid = vrf_oid;
+        rerouted.push_back(rentry);
+    }
+
+    if (!rerouted.empty())
+    {
+        m_l3ReroutedEntries[port_alias] = rerouted;
+    }
+}
+
+/*
+ * EVPN MH L3 restore: withdraw /32 host routes when the port comes back up.
+ */
+void FdbOrch::evpnMhWithdrawHostRoutes(const string &port_alias)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = m_l3ReroutedEntries.find(port_alias);
+    if (it == m_l3ReroutedEntries.end())
+        return;
+
+    SWSS_LOG_NOTICE("EVPN MH L3 restore: withdrawing %zu host routes for port %s",
+        it->second.size(), port_alias.c_str());
+
+    for (const auto &entry : it->second)
+    {
+        const auto &prefix = entry.prefix;
+        const auto &vrf_oid = entry.vrf_oid;
+        sai_route_entry_t route_entry;
+        route_entry.switch_id = gSwitchId;
+        route_entry.vr_id = vrf_oid;
+        copy(route_entry.destination, prefix);
+
+        auto pfx_str = prefix.to_string();
+
+        sai_status_t status = sai_route_api->remove_route_entry(&route_entry);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("EVPN MH L3 restore: failed to remove route %s, status %d",
+                pfx_str.c_str(), status);
+        }
+        else
+        {
+            SWSS_LOG_NOTICE("EVPN MH L3 restore: removed route %s", pfx_str.c_str());
+        }
+    }
+
+    m_l3ReroutedEntries.erase(it);
+}
+
+/*
+ * Get neighbors (IP, MAC) learned on a given port's VLAN, by querying APPL_DB NEIGH_TABLE.
+ * Key format: NEIGH_TABLE:<interface>:<ip>
+ * We match neighbors on VLAN interfaces that the port is a member of.
+ */
+vector<pair<IpAddress, MacAddress>> FdbOrch::getNeighborsOnPort(const string &port_alias)
+{
+    vector<pair<IpAddress, MacAddress>> result;
+
+    /* Get VLANs this port belongs to */
+    Port port;
+    if (!m_portsOrch->getPort(port_alias, port))
+    {
+        SWSS_LOG_ERROR("getNeighborsOnPort: port %s not found", port_alias.c_str());
+        return result;
+    }
+
+    vlan_members_t vlan_members;
+    m_portsOrch->getPortVlanMembers(port, vlan_members);
+
+    set<string> vlan_intfs;
+    for (const auto &member : vlan_members)
+    {
+        vlan_intfs.insert(string("Vlan") + to_string(member.first));
+        /* VPP uses bvivlan<N> as the BVI interface for the overlay */
+        vlan_intfs.insert(string("bvivlan") + to_string(member.first));
+    }
+
+    if (vlan_intfs.empty())
+    {
+        return result;
+    }
+
+    /* Query APPL_DB NEIGH_TABLE */
+    try {
+        swss::DBConnector appDb("APPL_DB", 0);
+        auto keys = appDb.keys("NEIGH_TABLE:*");
+
+        for (const auto &key : keys)
+        {
+            /* NEIGH_TABLE:Vlan10:10.0.0.2 */
+            auto first_colon = key.find(':');
+            if (first_colon == string::npos) continue;
+
+            auto second_colon = key.find(':', first_colon + 1);
+            if (second_colon == string::npos) continue;
+
+            string intf = key.substr(first_colon + 1, second_colon - first_colon - 1);
+            string ip_str = key.substr(second_colon + 1);
+
+            if (vlan_intfs.find(intf) == vlan_intfs.end())
+                continue;
+
+            /* Read the neighbor MAC from the hash */
+            auto fields = appDb.hgetall(key);
+            string mac_str;
+            for (const auto &fv : fields)
+            {
+                if (fv.first == "neigh")
+                {
+                    mac_str = fv.second;
+                    break;
+                }
+            }
+
+            if (mac_str.empty())
+                continue;
+
+            try {
+                IpAddress ip(ip_str);
+                MacAddress mac(mac_str);
+                result.push_back({ip, mac});
+            } catch (const std::exception &e) {
+                SWSS_LOG_WARN("getNeighborsOnPort: failed to parse neighbor %s: %s",
+                    key.c_str(), e.what());
+            }
+        }
+    } catch (const std::exception &e) {
+        SWSS_LOG_ERROR("getNeighborsOnPort: exception querying APPL_DB: %s", e.what());
+    }
+
+    SWSS_LOG_NOTICE("getNeighborsOnPort: found %zu neighbors on port %s",
+        result.size(), port_alias.c_str());
+    return result;
 }

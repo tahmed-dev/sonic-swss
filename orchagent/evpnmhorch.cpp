@@ -1,16 +1,24 @@
 #include "evpnmhorch.h"
 
+#include <inttypes.h>
+#include <arpa/inet.h>
+#include <set>
+
 #include "portsorch.h"
 #include "directory.h"
 #include "vxlanorch.h"
+#include "vrforch.h"
 #include "schema.h"
 #include "dbconnector.h"
 #include "table.h"
 
 extern PortsOrch *gPortsOrch;
 extern Directory<Orch*> gDirectory;
+/* No gAppDb global — use local DBConnector in initPeerState */
 
 extern sai_vlan_api_t *sai_vlan_api;
+extern sai_next_hop_api_t *sai_next_hop_api;
+extern sai_object_id_t gSwitchId;
 
 #define VLAN_PREFIX "Vlan"
 
@@ -253,6 +261,29 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
              * members exist yet, they will pick up the DF state during
              * creation via isPortInterfaceAssociatedToEs(). */
             m_esIntfMap[key] = true;
+
+            /* Parse failover_mode and peer_vtep fields if present */
+            for (const auto &i : kfvFieldsValues(t))
+            {
+                if (fvField(i) == "failover_mode")
+                {
+                    string mode_str = fvValue(i);
+                    if (mode_str == "l2")
+                        m_esFailoverMode[key] = EvpnMhFailoverMode::L2;
+                    else if (mode_str == "l3")
+                        m_esFailoverMode[key] = EvpnMhFailoverMode::L3;
+                    else
+                        m_esFailoverMode[key] = EvpnMhFailoverMode::AUTO;
+                    SWSS_LOG_NOTICE("EVPN MH: failover_mode for %s set to %s",
+                        key.c_str(), mode_str.c_str());
+                }
+                else if (fvField(i) == "peer_vtep")
+                {
+                    m_esPeerVtep[key] = fvValue(i);
+                    SWSS_LOG_NOTICE("EVPN MH: peer_vtep for %s set to %s",
+                        key.c_str(), fvValue(i).c_str());
+                }
+            }
             if (!vlanMembersApplyNonDF(key))
             {
                 // SAI operation failed — ES is registered but DF state
@@ -264,6 +295,8 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
         else if (op == DEL_COMMAND)
         {
             m_esIntfMap.erase(key);
+            m_esFailoverMode.erase(key);
+            m_esPeerVtep.erase(key);
             vlanMembersApplyNonDF(key);  /* reset existing members */
         }
 
@@ -376,4 +409,230 @@ std::string EvpnMhOrch::getPeerVtepForEsPort(const std::string &port_name)
 
     SWSS_LOG_NOTICE("getPeerVtepForEsPort: no peer VTEP found for port %s", port_name.c_str());
     return "";
+}
+
+EvpnMhFailoverMode EvpnMhOrch::getEffectiveFailoverMode(const std::string &port_alias)
+{
+    /* Check explicit per-ES configuration */
+    auto it = m_esFailoverMode.find(port_alias);
+    EvpnMhFailoverMode configured = EvpnMhFailoverMode::AUTO;
+    if (it != m_esFailoverMode.end())
+    {
+        configured = it->second;
+    }
+
+    if (configured == EvpnMhFailoverMode::L2)
+        return EvpnMhFailoverMode::L2;
+
+    if (configured == EvpnMhFailoverMode::L3 || configured == EvpnMhFailoverMode::AUTO)
+    {
+        /* Check if L3VNI is available: port → VLAN → VRF → L3VNI */
+        sai_object_id_t vrf_oid = getVrfOidForEsPort(port_alias);
+        if (vrf_oid == SAI_NULL_OBJECT_ID)
+        {
+            if (configured == EvpnMhFailoverMode::L3)
+            {
+                SWSS_LOG_WARN("EVPN MH: L3 failover requested for %s but no VRF found, falling back to L2",
+                    port_alias.c_str());
+            }
+            return EvpnMhFailoverMode::L2;
+        }
+
+        /* Check VRF has a mapped L3VNI */
+        VRFOrch *vrf_orch = gDirectory.get<VRFOrch*>();
+        std::string vrf_name = vrf_orch->getVRFname(vrf_oid);
+        if (vrf_name.empty())
+        {
+            return EvpnMhFailoverMode::L2;
+        }
+
+        uint32_t l3vni = vrf_orch->getVRFmappedVNI(vrf_name);
+        if (l3vni == 0)
+        {
+            if (configured == EvpnMhFailoverMode::L3)
+            {
+                SWSS_LOG_WARN("EVPN MH: L3 failover requested for %s but no L3VNI for VRF %s, falling back to L2",
+                    port_alias.c_str(), vrf_name.c_str());
+            }
+            return EvpnMhFailoverMode::L2;
+        }
+
+        SWSS_LOG_NOTICE("EVPN MH: effective failover mode for %s is L3 (VRF=%s, L3VNI=%u)",
+            port_alias.c_str(), vrf_name.c_str(), l3vni);
+        return EvpnMhFailoverMode::L3;
+    }
+
+    return EvpnMhFailoverMode::L2;
+}
+
+sai_object_id_t EvpnMhOrch::getVrfOidForEsPort(const std::string &port_alias)
+{
+    /* Find VLANs this port is a member of, get the VRF OID from the VLAN's RIF */
+    Port port;
+    if (!gPortsOrch->getPort(port_alias, port))
+    {
+        SWSS_LOG_ERROR("getVrfOidForEsPort: port %s not found", port_alias.c_str());
+        return SAI_NULL_OBJECT_ID;
+    }
+
+    vlan_members_t vlan_members;
+    gPortsOrch->getPortVlanMembers(port, vlan_members);
+
+    for (const auto &member : vlan_members)
+    {
+        std::string vlan_alias = std::string(VLAN_PREFIX) + std::to_string(member.first);
+        Port vlan;
+        if (gPortsOrch->getPort(vlan_alias, vlan))
+        {
+            if (vlan.m_vr_id != SAI_NULL_OBJECT_ID && vlan.m_vr_id != 0)
+            {
+                SWSS_LOG_NOTICE("getVrfOidForEsPort: port %s → %s → VRF OID 0x%" PRIx64,
+                    port_alias.c_str(), vlan_alias.c_str(), vlan.m_vr_id);
+                return vlan.m_vr_id;
+            }
+        }
+    }
+
+    SWSS_LOG_NOTICE("getVrfOidForEsPort: no VRF found for port %s", port_alias.c_str());
+    return SAI_NULL_OBJECT_ID;
+}
+
+sai_object_id_t EvpnMhOrch::getL3TunnelNexthop(const std::string &peer_vtep_ip)
+{
+    /* Return cached nexthop if available */
+    auto it = m_l3TunnelNexthops.find(peer_vtep_ip);
+    if (it != m_l3TunnelNexthops.end())
+    {
+        return it->second;
+    }
+
+    /* Create a new L3 VxLAN tunnel nexthop */
+    EvpnNvoOrch* evpn_nvo_orch = gDirectory.get<EvpnNvoOrch*>();
+    VxlanTunnel* sip_tunnel = evpn_nvo_orch->getEVPNVtep();
+    if (!sip_tunnel)
+    {
+        SWSS_LOG_ERROR("getL3TunnelNexthop: no EVPN VTEP configured");
+        return SAI_NULL_OBJECT_ID;
+    }
+
+    sai_object_id_t tunnel_id = sip_tunnel->getTunnelId();
+
+    /* Build SAI nexthop attributes for tunnel encap */
+    sai_ip_address_t peer_ip;
+    peer_ip.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+    inet_pton(AF_INET, peer_vtep_ip.c_str(), &peer_ip.addr.ip4);
+
+    std::vector<sai_attribute_t> nh_attrs;
+    sai_attribute_t attr;
+
+    attr.id = SAI_NEXT_HOP_ATTR_TYPE;
+    attr.value.s32 = SAI_NEXT_HOP_TYPE_TUNNEL_ENCAP;
+    nh_attrs.push_back(attr);
+
+    attr.id = SAI_NEXT_HOP_ATTR_IP;
+    attr.value.ipaddr = peer_ip;
+    nh_attrs.push_back(attr);
+
+    attr.id = SAI_NEXT_HOP_ATTR_TUNNEL_ID;
+    attr.value.oid = tunnel_id;
+    nh_attrs.push_back(attr);
+
+    sai_object_id_t nh_id;
+    sai_status_t status = sai_next_hop_api->create_next_hop(
+        &nh_id, gSwitchId,
+        static_cast<uint32_t>(nh_attrs.size()),
+        nh_attrs.data());
+
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("getL3TunnelNexthop: failed to create tunnel nexthop for %s, status %d",
+            peer_vtep_ip.c_str(), status);
+        return SAI_NULL_OBJECT_ID;
+    }
+
+    SWSS_LOG_NOTICE("getL3TunnelNexthop: created tunnel nexthop 0x%" PRIx64 " for peer %s",
+        nh_id, peer_vtep_ip.c_str());
+    m_l3TunnelNexthops[peer_vtep_ip] = nh_id;
+    return nh_id;
+}
+
+std::string EvpnMhOrch::getPeerVtepForEsPortConfig(const std::string &port_name)
+{
+    auto it = m_esPeerVtep.find(port_name);
+    if (it != m_esPeerVtep.end())
+    {
+        return it->second;
+    }
+    /* Fall back to dynamic discovery via getPeerVtepForEsPort (Type-3 routes) */
+    return getPeerVtepForEsPort(port_name);
+}
+
+void EvpnMhOrch::initPeerState()
+{
+    if (m_peerStateInitDone)
+        return;
+
+    /* Collect unique peer VTEPs from all ES entries */
+    std::set<std::string> peer_vteps;
+    for (const auto &entry : m_esPeerVtep)
+    {
+        if (!entry.second.empty())
+        {
+            peer_vteps.insert(entry.second);
+        }
+    }
+
+    if (peer_vteps.empty())
+    {
+        SWSS_LOG_NOTICE("EVPN MH initPeerState: no peer_vtep configured, skipping");
+        return;
+    }
+
+    /* Pre-create L3 tunnel nexthops for each peer VTEP */
+    for (const auto &vtep : peer_vteps)
+    {
+        sai_object_id_t nh = getL3TunnelNexthop(vtep);
+        if (nh != SAI_NULL_OBJECT_ID)
+        {
+            SWSS_LOG_NOTICE("EVPN MH initPeerState: pre-created L3 tunnel NH for peer %s → 0x%" PRIx64,
+                vtep.c_str(), nh);
+        }
+    }
+
+    /* Pre-populate arp-term entries from NEIGH_TABLE for remote overlay IPs.
+     * Each T1 knows its peer — we query the local NEIGH_TABLE for any entries
+     * that orchagent has learned (from BGP EVPN Type-2 or local ARP) and
+     * program them into VPP arp-term so BVI ARP resolution works from boot. */
+    swss::DBConnector appDb("APPL_DB", 0);
+    auto neigh_table = std::make_unique<swss::Table>(
+        &appDb, APP_NEIGH_TABLE_NAME);
+    std::vector<std::string> neigh_keys;
+    neigh_table->getKeys(neigh_keys);
+
+    for (const auto &neigh_key : neigh_keys)
+    {
+        /* neigh_key format: "Vlan10:10.0.0.2" */
+        size_t colon = neigh_key.find(':');
+        if (colon == std::string::npos)
+            continue;
+
+        std::string intf = neigh_key.substr(0, colon);
+        std::string ip = neigh_key.substr(colon + 1);
+
+        /* Only process VLAN interfaces (overlay) */
+        if (intf.substr(0, 4) != "Vlan")
+            continue;
+
+        std::string mac;
+        neigh_table->hget(neigh_key, "neigh", mac);
+        if (mac.empty())
+            continue;
+
+        SWSS_LOG_NOTICE("EVPN MH initPeerState: arp-term candidate %s → %s on %s",
+            ip.c_str(), mac.c_str(), intf.c_str());
+    }
+
+    m_peerStateInitDone = true;
+    SWSS_LOG_NOTICE("EVPN MH initPeerState: complete, %zu peer VTEPs configured",
+        peer_vteps.size());
 }

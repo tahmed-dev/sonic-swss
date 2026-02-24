@@ -103,3 +103,4 @@ orchagent/p4orch/tests/p4orch_tests
 
 build-env/.env
 build-env/custom-setup.sh
+.pc
