@@ -168,6 +168,16 @@ private:
     void evpnMhRerouteToTunnel(const Port& downPort);
     void evpnMhRestoreFromTunnel(const Port& upPort);
 
+    /* EVPN MH L3 failover: inject/withdraw host routes via L3 VxLAN tunnel */
+    void evpnMhInjectHostRoutes(const std::string &port_alias);
+    void evpnMhWithdrawHostRoutes(const std::string &port_alias);
+    std::vector<std::pair<IpAddress, MacAddress>> getNeighborsOnPort(const std::string &port_alias);
+    std::vector<std::pair<IpAddress, MacAddress>> getNeighborsFromEvpnType2(const std::string &port_alias);
+
+    /* EVPN MH neighbor cache from fdbsyncd's EVPN_MH_NEIGH_TABLE */
+    std::map<std::string, std::string> m_evpnMhNeighCache;
+    void doEvpnMhNeighTask(Consumer &consumer);
+
     /* Cache of FDB entries rerouted during ES port failover.
      * Key: port alias, Value: vector of {FdbEntry, original FdbData} */
     struct ReroutedFdbEntry {
@@ -175,6 +185,13 @@ private:
         FdbData  origData;
     };
     unordered_map<string, vector<ReroutedFdbEntry>> m_reroutedEntries;
+
+    /* L3 failover: tracked host routes injected during failover */
+    struct L3ReroutedEntry {
+        IpPrefix prefix;
+        sai_object_id_t vrf_oid;
+    };
+    std::map<std::string, std::vector<L3ReroutedEntry>> m_l3ReroutedEntries;
 };
 
 #endif /* SWSS_FDBORCH_H */

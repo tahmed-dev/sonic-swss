@@ -9,6 +9,7 @@
 #include <netlink/route/neighbour.h>
 #include <netlink/route/link/vxlan.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 
 #include "logger.h"
 #include "dbconnector.h"
@@ -40,6 +41,8 @@ FdbSync::FdbSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector
         m_AppRestartAssist->registerAppTable(APP_VXLAN_FDB_TABLE_NAME, &m_fdbTable);
         m_AppRestartAssist->registerAppTable(APP_VXLAN_REMOTE_VNI_TABLE_NAME, &m_imetTable);
     }
+
+    m_evpnMhNeighTable = std::make_unique<ProducerStateTable>(pipelineAppDB, "EVPN_MH_NEIGH_TABLE");
 }
 
 FdbSync::~FdbSync()
@@ -735,7 +738,7 @@ void FdbSync::macDelVxlanDB(string key)
 }
 
 void FdbSync::macAddVxlan(string key, struct nl_addr *vtep, string type, uint32_t vni, string intf_name,
-     string nexthop_group, NEXT_HOP_VALUE_TYPE dest_type, uint8_t protocol)
+     string nexthop_group, NEXT_HOP_VALUE_TYPE dest_type, uint8_t protocol, uint32_t ext_flags)
 {
     std::vector<FieldValueTuple> fvVector;
     string svni = to_string(vni);
@@ -793,6 +796,12 @@ void FdbSync::macAddVxlan(string key, struct nl_addr *vtep, string type, uint32_
     fvVector.push_back(fv_type);
     fvVector.push_back(fv_vni);
     fvVector.push_back(fv_protocol);
+
+    if (ext_flags != 0)
+    {
+        FieldValueTuple fv_ext("ext_flags", to_string(ext_flags));
+        fvVector.push_back(fv_ext);
+    }
 
     // If warmstart is in progress, we take all netlink changes into the cache map
     if (m_AppRestartAssist && m_AppRestartAssist->isWarmStartInProgress())
@@ -1248,6 +1257,11 @@ void FdbSync::onMsgNbrRaw(struct nlmsghdr *msg)
     /* Only MAC routes (AF_BRIDGE) */
     if (ndm->ndm_family != AF_BRIDGE)
     {
+        /* Handle AF_INET/AF_INET6 neighbor events for EVPN MH */
+        if (ndm->ndm_family == AF_INET || ndm->ndm_family == AF_INET6)
+        {
+            onNeighborEvent(msg);
+        }
         return;
     }
 
@@ -1257,7 +1271,8 @@ void FdbSync::onMsgNbrRaw(struct nlmsghdr *msg)
     bool has_nhid = false;
     bool has_dst = false;
     struct in_addr dst_v4 = {0};
-    uint32_t ext_flags __attribute__((unused)) = 0;
+    uint32_t ext_flags = 0;
+    uint8_t protocol = RTPROT_UNSPEC;
 
     struct rtattr *rta = (struct rtattr *)((char *)ndm + NLMSG_ALIGN(sizeof(*ndm)));
 
@@ -1287,7 +1302,12 @@ void FdbSync::onMsgNbrRaw(struct nlmsghdr *msg)
             }
             break;
         case NDA_FLAGS_EXT:
-            ext_flags = *(uint32_t *)RTA_DATA(rta);
+            if (RTA_PAYLOAD(rta) >= sizeof(uint32_t))
+                ext_flags = *(uint32_t *)RTA_DATA(rta);
+            break;
+        case NDA_PROTOCOL:
+            if (RTA_PAYLOAD(rta) >= sizeof(uint8_t))
+                protocol = *(uint8_t *)RTA_DATA(rta);
             break;
         default:
             break;
@@ -1347,13 +1367,13 @@ void FdbSync::onMsgNbrRaw(struct nlmsghdr *msg)
     if (has_nhid && nhid != 0)
     {
         /* MAC points to a nexthop group */
-        macAddVxlan(key, NULL, type, vni, ifname, to_string(nhid), NEXTHOPGROUP, RTPROT_UNSPEC);
+        macAddVxlan(key, NULL, type, vni, ifname, to_string(nhid), NEXTHOPGROUP, protocol, ext_flags);
     }
     else if (has_dst && dst_v4.s_addr != 0)
     {
         /* MAC points to a remote VTEP */
         struct nl_addr *vtep_addr = nl_addr_build(AF_INET, &dst_v4, sizeof(dst_v4));
-        macAddVxlan(key, vtep_addr, type, vni, ifname, "0", VTEP, RTPROT_UNSPEC);
+        macAddVxlan(key, vtep_addr, type, vni, ifname, "0", VTEP, protocol, ext_flags);
         nl_addr_put(vtep_addr);
     }
 }
@@ -1378,5 +1398,107 @@ void FdbSync::onMsgRaw(struct nlmsghdr *msg)
     else if (msg->nlmsg_type == RTM_NEWNEXTHOP || msg->nlmsg_type == RTM_DELNEXTHOP)
     {
         onMsgNhg(msg);
+    }
+}
+
+/*
+ * Handle AF_INET/AF_INET6 neighbor events on Vlan SVIs.
+ * Publishes EVPN MH neighbors (installed by FRR with NTF_EXT_VALIDATED)
+ * to APPL_DB EVPN_MH_NEIGH_TABLE for orchagent consumption.
+ */
+void FdbSync::onNeighborEvent(struct nlmsghdr *msg)
+{
+    struct ndmsg *ndm = (struct ndmsg *)NLMSG_DATA(msg);
+    int len = (int)(msg->nlmsg_len - NLMSG_LENGTH(sizeof(*ndm)));
+
+    /* Parse attributes: NDA_DST (IP), NDA_LLADDR (MAC), NDA_FLAGS_EXT, NDA_PROTOCOL */
+    char ip_buf[INET6_ADDRSTRLEN] = {};
+    char mac_buf[MAX_ADDR_SIZE + 1] = {};
+    uint32_t ext_flags = 0;
+    uint8_t protocol = 0;
+
+    struct rtattr *rta = (struct rtattr *)((char *)ndm + NLMSG_ALIGN(sizeof(*ndm)));
+    for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len))
+    {
+        switch (rta->rta_type)
+        {
+        case NDA_DST:
+            if (ndm->ndm_family == AF_INET && RTA_PAYLOAD(rta) == 4)
+                inet_ntop(AF_INET, RTA_DATA(rta), ip_buf, sizeof(ip_buf));
+            else if (ndm->ndm_family == AF_INET6 && RTA_PAYLOAD(rta) == 16)
+                inet_ntop(AF_INET6, RTA_DATA(rta), ip_buf, sizeof(ip_buf));
+            break;
+        case NDA_LLADDR:
+            if (RTA_PAYLOAD(rta) == 6) {
+                uint8_t *m = (uint8_t *)RTA_DATA(rta);
+                snprintf(mac_buf, sizeof(mac_buf), "%02x:%02x:%02x:%02x:%02x:%02x",
+                         m[0], m[1], m[2], m[3], m[4], m[5]);
+            }
+            break;
+        case NDA_FLAGS_EXT:
+            if (RTA_PAYLOAD(rta) >= sizeof(uint32_t))
+                ext_flags = *(uint32_t *)RTA_DATA(rta);
+            break;
+        case NDA_PROTOCOL:
+            if (RTA_PAYLOAD(rta) >= sizeof(uint8_t))
+                protocol = *(uint8_t *)RTA_DATA(rta);
+            break;
+        }
+    }
+
+    if (ip_buf[0] == '\0' || mac_buf[0] == '\0')
+        return;
+
+    /* Get interface name from ifindex */
+    int ifindex = ndm->ndm_ifindex;
+    char ifname[IF_NAMESIZE] = {};
+    if (!if_indextoname(ifindex, ifname))
+        return;
+
+    string intf(ifname);
+    /* Only process Vlan interfaces (EVPN SVIs) */
+    if (intf.substr(0, 4) != "Vlan")
+        return;
+
+    /* Only process neighbors with EVPN-related flags:
+     * - NTF_EXT_EXT_VALIDATED (externally validated by FRR for MH peer-synced)
+     * - protocol == RTPROT_ZEBRA (FRR-installed)
+     * - NUD_PERMANENT or NUD_REACHABLE state (static or confirmed)
+     */
+    bool is_evpn = (ext_flags & NTF_EXT_EXT_VALIDATED) ||
+                   (protocol == RTPROT_ZEBRA) ||
+                   (ndm->ndm_state & (NUD_PERMANENT | NUD_REACHABLE));
+
+    if (!is_evpn)
+        return;
+
+    string key = intf + ":" + string(ip_buf);
+
+    if (msg->nlmsg_type == RTM_DELNEIGH ||
+        ndm->ndm_state == NUD_FAILED ||
+        ndm->ndm_state == NUD_INCOMPLETE)
+    {
+        /* Delete */
+        m_evpn_mh_neigh.erase(key);
+        m_evpnMhNeighTable->del(key);
+        SWSS_LOG_NOTICE("EVPN_MH_NEIGH_TABLE: DEL %s", key.c_str());
+    }
+    else
+    {
+        /* Add/Update */
+        EvpnMhNeighEntry entry;
+        entry.mac = mac_buf;
+        entry.ext_flags = ext_flags;
+        entry.protocol = protocol;
+        m_evpn_mh_neigh[key] = entry;
+
+        vector<FieldValueTuple> fvs;
+        fvs.push_back({"neigh", mac_buf});
+        fvs.push_back({"protocol", to_string(protocol)});
+        fvs.push_back({"ext_flags", to_string(ext_flags)});
+        fvs.push_back({"family", ndm->ndm_family == AF_INET ? "IPv4" : "IPv6"});
+        m_evpnMhNeighTable->set(key, fvs);
+        SWSS_LOG_NOTICE("EVPN_MH_NEIGH_TABLE: SET %s mac=%s proto=%u ext_flags=0x%x",
+            key.c_str(), mac_buf, protocol, ext_flags);
     }
 }
