@@ -172,6 +172,11 @@ private:
     void evpnMhInjectHostRoutes(const std::string &port_alias);
     void evpnMhWithdrawHostRoutes(const std::string &port_alias);
     std::vector<std::pair<IpAddress, MacAddress>> getNeighborsOnPort(const std::string &port_alias);
+    std::vector<std::pair<IpAddress, MacAddress>> getNeighborsFromEvpnType2(const std::string &port_alias);
+
+    /* EVPN MH neighbor cache from fdbsyncd's EVPN_MH_NEIGH_TABLE */
+    std::map<std::string, std::string> m_evpnMhNeighCache;
+    void doEvpnMhNeighTask(Consumer &consumer);
 
     /* Cache of FDB entries rerouted during ES port failover.
      * Key: port alias, Value: vector of {FdbEntry, original FdbData} */

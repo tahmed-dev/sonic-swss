@@ -56,6 +56,12 @@ public:
     std::string getPeerVtepForEsPortConfig(const std::string &port_name);
     void initPeerState();
 
+    /* Server IPs behind an ES port (from ConfigDB) */
+    std::vector<IpPrefix> getServerIpsForEsPort(const std::string &port_name);
+
+    /* Check if the peer VTEP still has the ES active (via FRR zebra) */
+    bool isPeerEsActive(const std::string &port_name);
+
 private:
     std::map<std::string, struct EsCacheEntry *> m_esDataMap;
     std::map<std::string, bool> m_esIntfMap;
@@ -66,6 +72,10 @@ private:
     /* Per-ES peer VTEP IP (sister T1) from config — enables pre-provisioning
      * of tunnels, arp-term entries, and L3 nexthops at init time */
     std::map<std::string, std::string> m_esPeerVtep;
+
+    /* Per-ES server IPs from config — static mapping of port → server overlay IPs
+     * for L3 failover host route injection (avoids dependency on FDB/neighbor table) */
+    std::map<std::string, std::vector<IpPrefix>> m_esServerIps;
 
     /* Cache of L3 VxLAN tunnel nexthops: peer_vtep_ip → SAI nexthop OID */
     std::map<std::string, sai_object_id_t> m_l3TunnelNexthops;

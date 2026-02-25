@@ -3,7 +3,9 @@
 
 #include <string>
 #include <vector>
+#include <map>
 #include <unordered_map>
+#include <memory>
 #include <arpa/inet.h>
 #include "dbconnector.h"
 #include "producerstatetable.h"
@@ -103,6 +105,19 @@ private:
     AppRestartAssist  *m_AppRestartAssist;
     SubscriberStateTable m_cfgEvpnNvoTable;
 
+    /* EVPN MH neighbor cache: maps "Vlan<N>:<IP>" → {mac, flags} */
+    struct EvpnMhNeighEntry {
+        std::string mac;
+        uint32_t ext_flags;
+        uint8_t protocol;
+    };
+    std::map<std::string, EvpnMhNeighEntry> m_evpn_mh_neigh;
+
+    /* APPL_DB table for EVPN MH neighbors */
+    std::unique_ptr<ProducerStateTable> m_evpnMhNeighTable;
+
+    void onNeighborEvent(struct nlmsghdr *msg);
+
     struct m_local_fdb_info
     {
         std::string port_name;
@@ -168,7 +183,7 @@ private:
     std::unordered_map<int, intf> m_intf_info;
 
     void addLocalMac(std::string key, std::string op);
-    void macAddVxlan(std::string key, struct nl_addr *vtep, std::string type, uint32_t vni, std::string intf_name, std::string nexthop_group, NEXT_HOP_VALUE_TYPE dest_type, uint8_t protocol);
+    void macAddVxlan(std::string key, struct nl_addr *vtep, std::string type, uint32_t vni, std::string intf_name, std::string nexthop_group, NEXT_HOP_VALUE_TYPE dest_type, uint8_t protocol, uint32_t ext_flags = 0);
     void macDelVxlan(std::string auxkey);
     void macDelVxlanDB(std::string key);
     void imetAddRoute(struct in_addr vtep, std::string ifname, uint32_t vni);
