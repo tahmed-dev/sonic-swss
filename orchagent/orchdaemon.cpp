@@ -207,7 +207,8 @@ bool OrchDaemon::init()
     vector<table_name_with_pri_t> app_fdb_tables = {
         { APP_FDB_TABLE_NAME,        FdbOrch::fdborch_pri},
         { APP_VXLAN_FDB_TABLE_NAME,  FdbOrch::fdborch_pri},
-        { APP_MCLAG_FDB_TABLE_NAME,  FdbOrch::fdborch_pri}
+        { APP_MCLAG_FDB_TABLE_NAME,  FdbOrch::fdborch_pri},
+        { "EVPN_MH_NEIGH_TABLE",    FdbOrch::fdborch_pri}
     };
 
     gPortsOrch = new PortsOrch(m_applDb, m_stateDb, ports_tables, m_chassisAppDb);

@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <arpa/inet.h>
 #include <set>
+#include <sstream>
 
 #include "portsorch.h"
 #include "directory.h"
@@ -283,6 +284,32 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
                     SWSS_LOG_NOTICE("EVPN MH: peer_vtep for %s set to %s",
                         key.c_str(), fvValue(i).c_str());
                 }
+                else if (fvField(i) == "server_ipv4")
+                {
+                    /* Comma-separated list of server overlay IPs, e.g. "10.0.0.2/32,10.0.0.3/32" */
+                    m_esServerIps[key].clear();
+                    string ips_str = fvValue(i);
+                    stringstream ss(ips_str);
+                    string token;
+                    while (getline(ss, token, ','))
+                    {
+                        /* Trim whitespace */
+                        token.erase(0, token.find_first_not_of(" "));
+                        token.erase(token.find_last_not_of(" ") + 1);
+                        if (token.empty()) continue;
+                        /* Add /32 if not present */
+                        if (token.find('/') == string::npos)
+                            token += "/32";
+                        try {
+                            m_esServerIps[key].push_back(IpPrefix(token));
+                            SWSS_LOG_NOTICE("EVPN MH: server_ipv4 for %s: %s",
+                                key.c_str(), token.c_str());
+                        } catch (const std::exception &e) {
+                            SWSS_LOG_ERROR("EVPN MH: invalid server_ipv4 '%s' for %s: %s",
+                                token.c_str(), key.c_str(), e.what());
+                        }
+                    }
+                }
             }
             if (!vlanMembersApplyNonDF(key))
             {
@@ -297,6 +324,7 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
             m_esIntfMap.erase(key);
             m_esFailoverMode.erase(key);
             m_esPeerVtep.erase(key);
+            m_esServerIps.erase(key);
             vlanMembersApplyNonDF(key);  /* reset existing members */
         }
 
@@ -635,4 +663,140 @@ void EvpnMhOrch::initPeerState()
     m_peerStateInitDone = true;
     SWSS_LOG_NOTICE("EVPN MH initPeerState: complete, %zu peer VTEPs configured",
         peer_vteps.size());
+}
+
+std::vector<IpPrefix> EvpnMhOrch::getServerIpsForEsPort(const std::string &port_name)
+{
+    auto it = m_esServerIps.find(port_name);
+    if (it != m_esServerIps.end())
+    {
+        return it->second;
+    }
+    return {};
+}
+
+/*
+ * Check if the peer VTEP still has the Ethernet Segment active by querying
+ * FRR's zebra EVPN ES detail table.  We look for the ES block matching the
+ * given port's interface name and check if remote VTEPs are present.
+ *
+ * This prevents black-hole tunnel routes when both T1s lose their PortChannel
+ * to a server (i.e., the server is completely disconnected).
+ *
+ * Uses `vtysh -c 'show evpn es detail'` and parses the output for:
+ *   ESI: <esi>
+ *     Interface: <port>
+ *     Type: <flags containing "Remote">
+ *     VTEPs:
+ *       <vtep_ip>
+ *
+ * If no remote VTEPs are listed for this port's ES, the peer has also lost
+ * the ES and traffic should not be tunneled.
+ */
+bool EvpnMhOrch::isPeerEsActive(const std::string &port_name)
+{
+    SWSS_LOG_ENTER();
+
+    std::string cmd = "vtysh -c 'show evpn es detail' 2>/dev/null";
+    FILE *fp = popen(cmd.c_str(), "r");
+    if (!fp)
+    {
+        SWSS_LOG_ERROR("isPeerEsActive: failed to run vtysh for port %s", port_name.c_str());
+        /* Fail-open: assume peer is active to avoid dropping traffic unnecessarily */
+        return true;
+    }
+
+    char buf[512];
+    bool in_matching_es = false;
+    bool in_vteps_section = false;
+    bool has_remote_vtep = false;
+    bool found_es = false;
+
+    while (fgets(buf, sizeof(buf), fp))
+    {
+        std::string line(buf);
+
+        /* Detect start of a new ES block: "ESI: 03:aa:bb:..." */
+        if (line.find("ESI:") != std::string::npos)
+        {
+            /* If we were already in the matching block, we're done */
+            if (in_matching_es)
+                break;
+
+            in_matching_es = false;
+            in_vteps_section = false;
+        }
+
+        /* Check if this ES block matches our port by interface name.
+         * FRR output includes a line like: "  Interface: PortChannel1" */
+        if (line.find("Interface:") != std::string::npos)
+        {
+            auto colon_pos = line.find(':');
+            if (colon_pos != std::string::npos)
+            {
+                std::string intf = line.substr(colon_pos + 1);
+                intf.erase(0, intf.find_first_not_of(" \t"));
+                intf.erase(intf.find_last_not_of(" \t\r\n") + 1);
+
+                if (intf == port_name)
+                {
+                    in_matching_es = true;
+                    found_es = true;
+                    SWSS_LOG_NOTICE("isPeerEsActive: found ES block for port %s",
+                        port_name.c_str());
+                }
+            }
+        }
+
+        if (!in_matching_es)
+            continue;
+
+        /* Check Type line for "Remote" flag */
+        if (line.find("Type:") != std::string::npos &&
+            line.find("Remote") != std::string::npos)
+        {
+            has_remote_vtep = true;
+            SWSS_LOG_NOTICE("isPeerEsActive: ES for %s has Remote type flag",
+                port_name.c_str());
+        }
+
+        /* Parse VTEPs section */
+        if (line.find("VTEPs:") != std::string::npos)
+        {
+            in_vteps_section = true;
+            continue;
+        }
+
+        if (in_vteps_section)
+        {
+            std::string trimmed = line;
+            trimmed.erase(0, trimmed.find_first_not_of(" \t"));
+            trimmed.erase(trimmed.find_last_not_of(" \t\r\n") + 1);
+
+            if (trimmed.empty())
+            {
+                in_vteps_section = false;
+            }
+            else
+            {
+                has_remote_vtep = true;
+                SWSS_LOG_NOTICE("isPeerEsActive: ES for %s has remote VTEP %s",
+                    port_name.c_str(), trimmed.c_str());
+                break;
+            }
+        }
+    }
+
+    pclose(fp);
+
+    if (!found_es)
+    {
+        SWSS_LOG_WARN("isPeerEsActive: no ES block found for port %s in FRR, assuming active",
+            port_name.c_str());
+        return true;  /* Fail-open */
+    }
+
+    SWSS_LOG_NOTICE("isPeerEsActive: port %s peer ES active = %s",
+        port_name.c_str(), has_remote_vtep ? "yes" : "no");
+    return has_remote_vtep;
 }
