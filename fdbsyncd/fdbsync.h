@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <memory>
 #include <arpa/inet.h>
@@ -116,7 +117,14 @@ private:
     /* APPL_DB table for EVPN MH neighbors */
     std::unique_ptr<ProducerStateTable> m_evpnMhNeighTable;
 
+    /* APPL_DB table for EVPN MH ES state (remote VTEP list per ES port) */
+    std::unique_ptr<ProducerStateTable> m_evpnMhEsStateTable;
+
+    /* Cached ES remote VTEP state: es_port → set of active VTEP IPs */
+    std::map<std::string, std::set<std::string>> m_esRemoteVteps;
+
     void onNeighborEvent(struct nlmsghdr *msg);
+    void updateEsRemoteVteps(const std::string &es_port, const std::set<std::string> &vteps);
 
     struct m_local_fdb_info
     {

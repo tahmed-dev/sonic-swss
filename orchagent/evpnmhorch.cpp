@@ -6,6 +6,7 @@
 #include <sstream>
 
 #include "portsorch.h"
+#include "neighorch.h"
 #include "directory.h"
 #include "vxlanorch.h"
 #include "vrforch.h"
@@ -14,11 +15,14 @@
 #include "table.h"
 
 extern PortsOrch *gPortsOrch;
+extern NeighOrch *gNeighOrch;
 extern Directory<Orch*> gDirectory;
 /* No gAppDb global — use local DBConnector in initPeerState */
 
 extern sai_vlan_api_t *sai_vlan_api;
 extern sai_next_hop_api_t *sai_next_hop_api;
+extern sai_next_hop_group_api_t *sai_next_hop_group_api;
+extern sai_route_api_t *sai_route_api;
 extern sai_object_id_t gSwitchId;
 
 #define VLAN_PREFIX "Vlan"
@@ -273,6 +277,8 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
                         m_esFailoverMode[key] = EvpnMhFailoverMode::L2;
                     else if (mode_str == "l3")
                         m_esFailoverMode[key] = EvpnMhFailoverMode::L3;
+                    else if (mode_str == "hw")
+                        m_esFailoverMode[key] = EvpnMhFailoverMode::HW;
                     else
                         m_esFailoverMode[key] = EvpnMhFailoverMode::AUTO;
                     SWSS_LOG_NOTICE("EVPN MH: failover_mode for %s set to %s",
@@ -283,6 +289,29 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
                     m_esPeerVtep[key] = fvValue(i);
                     SWSS_LOG_NOTICE("EVPN MH: peer_vtep for %s set to %s",
                         key.c_str(), fvValue(i).c_str());
+                }
+                else if (fvField(i) == "peer_vteps")
+                {
+                    /* Comma-separated list of sister T1 VTEP IPs for HW FRR.
+                     * Order defines bitmask indexing: sister[0]=bit 0, etc. */
+                    m_esPeerVtepList[key].clear();
+                    string vteps_str = fvValue(i);
+                    stringstream ss(vteps_str);
+                    string token;
+                    while (getline(ss, token, ','))
+                    {
+                        token.erase(0, token.find_first_not_of(" "));
+                        token.erase(token.find_last_not_of(" ") + 1);
+                        if (!token.empty())
+                        {
+                            m_esPeerVtepList[key].push_back(token);
+                            SWSS_LOG_NOTICE("EVPN MH: peer_vteps[%zu] for %s: %s",
+                                m_esPeerVtepList[key].size() - 1, key.c_str(), token.c_str());
+                        }
+                    }
+                    /* Also set single peer_vtep for backward compat (first in list) */
+                    if (!m_esPeerVtepList[key].empty())
+                        m_esPeerVtep[key] = m_esPeerVtepList[key][0];
                 }
                 else if (fvField(i) == "server_ipv4")
                 {
@@ -318,12 +347,34 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
                 ++it;
                 continue;
             }
+
+            /* HW FRR: create protection groups if configured */
+            auto mode_it = m_esFailoverMode.find(key);
+            if (mode_it != m_esFailoverMode.end() &&
+                mode_it->second == EvpnMhFailoverMode::HW)
+            {
+                sai_status_t status = createHwFrrProtectionGroups(key);
+                if (status != SAI_STATUS_SUCCESS)
+                {
+                    SWSS_LOG_WARN("EVPN MH HW FRR: failed to create protection groups for %s (status=%d), "
+                                  "will retry", key.c_str(), status);
+                    ++it;
+                    continue;
+                }
+            }
         }
         else if (op == DEL_COMMAND)
         {
+            /* HW FRR: remove protection groups before erasing config */
+            if (m_hwFrrState.find(key) != m_hwFrrState.end())
+            {
+                removeHwFrrProtectionGroups(key);
+            }
+
             m_esIntfMap.erase(key);
             m_esFailoverMode.erase(key);
             m_esPeerVtep.erase(key);
+            m_esPeerVtepList.erase(key);
             m_esServerIps.erase(key);
             vlanMembersApplyNonDF(key);  /* reset existing members */
         }
@@ -373,12 +424,13 @@ void EvpnMhOrch::doTask(Consumer &consumer)
     {
         doEvpnEsDfTask(consumer);
     }
-    else
+    else if (table_name == "EVPN_ETHERNET_SEGMENT")
     {
-        if (table_name == "EVPN_ETHERNET_SEGMENT")
-        {
-            doEvpnEsIntfTask(consumer);
-        }
+        doEvpnEsIntfTask(consumer);
+    }
+    else if (table_name == "EVPN_MH_ES_STATE_TABLE")
+    {
+        doEvpnMhEsStateTask(consumer);
     }
 }
 
@@ -451,6 +503,29 @@ EvpnMhFailoverMode EvpnMhOrch::getEffectiveFailoverMode(const std::string &port_
 
     if (configured == EvpnMhFailoverMode::L2)
         return EvpnMhFailoverMode::L2;
+
+    if (configured == EvpnMhFailoverMode::HW)
+    {
+        /* HW FRR requires peer_vteps and server_ipv4 configured */
+        auto vtep_it = m_esPeerVtepList.find(port_alias);
+        auto sip_it = m_esServerIps.find(port_alias);
+        if ((vtep_it == m_esPeerVtepList.end() || vtep_it->second.empty()) &&
+            (m_esPeerVtep.find(port_alias) == m_esPeerVtep.end() || m_esPeerVtep[port_alias].empty()))
+        {
+            SWSS_LOG_WARN("EVPN MH: HW failover requested for %s but no peer_vteps configured, "
+                          "falling back to L3/L2", port_alias.c_str());
+            /* Fall through to L3/AUTO logic */
+        }
+        else if (sip_it == m_esServerIps.end() || sip_it->second.empty())
+        {
+            SWSS_LOG_WARN("EVPN MH: HW failover requested for %s but no server_ipv4 configured, "
+                          "falling back to L3/L2", port_alias.c_str());
+        }
+        else
+        {
+            return EvpnMhFailoverMode::HW;
+        }
+    }
 
     if (configured == EvpnMhFailoverMode::L3 || configured == EvpnMhFailoverMode::AUTO)
     {
@@ -675,6 +750,205 @@ std::vector<IpPrefix> EvpnMhOrch::getServerIpsForEsPort(const std::string &port_
     return {};
 }
 
+bool EvpnMhOrch::isHwFrrServerIp(const IpAddress &ip)
+{
+    for (auto const &es_entry : m_esServerIps)
+    {
+        const std::string &port_name = es_entry.first;
+        if (getEffectiveFailoverMode(port_name) != EvpnMhFailoverMode::HW)
+        {
+            continue;
+        }
+        for (auto const &prefix : es_entry.second)
+        {
+            if (prefix.getIp() == ip)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * Process EVPN_MH_ES_STATE_TABLE updates from fdbsyncd.
+ * Key: <es_port> (e.g. "PortChannel0")
+ * Fields:
+ *   active_vteps: comma-separated list of currently active sister VTEP IPs
+ *
+ * This is triggered when fdbsyncd detects ES remote VTEP changes via FRR
+ * (BGP Type-1 AD-per-ES route add/withdraw from sisters).
+ *
+ * Converts the active VTEP list to a bitmask using the configured sister
+ * ordering (from peer_vteps), then calls updateHwFrrActiveSisters().
+ */
+void EvpnMhOrch::doEvpnMhEsStateTask(Consumer &consumer)
+{
+    auto it = consumer.m_toSync.begin();
+
+    while (it != consumer.m_toSync.end())
+    {
+        KeyOpFieldsValuesTuple t = it->second;
+        string es_port = kfvKey(t);
+        string op = kfvOp(t);
+
+        SWSS_LOG_NOTICE("doEvpnMhEsStateTask: op=%s es_port=%s", op.c_str(), es_port.c_str());
+
+        if (op == SET_COMMAND)
+        {
+            /* Only relevant for HW FRR ports */
+            auto state_it = m_hwFrrState.find(es_port);
+            if (state_it == m_hwFrrState.end())
+            {
+                SWSS_LOG_NOTICE("EVPN MH ES state: ignoring update for %s (no HW FRR state)",
+                                es_port.c_str());
+                it = consumer.m_toSync.erase(it);
+                continue;
+            }
+
+            EsHwFrrState &state = state_it->second;
+
+            /* Parse active_vteps field */
+            std::set<std::string> active_vtep_set;
+            for (const auto &fv : kfvFieldsValues(t))
+            {
+                if (fvField(fv) == "active_vteps")
+                {
+                    stringstream ss(fvValue(fv));
+                    string token;
+                    while (getline(ss, token, ','))
+                    {
+                        token.erase(0, token.find_first_not_of(" "));
+                        token.erase(token.find_last_not_of(" ") + 1);
+                        if (!token.empty())
+                            active_vtep_set.insert(token);
+                    }
+                }
+            }
+
+            /* Convert VTEP IPs to bitmask using configured sister ordering */
+            uint8_t new_mask = 0;
+            for (const auto &sister : state.sisters)
+            {
+                if (active_vtep_set.count(sister.vtep_ip.to_string()))
+                {
+                    new_mask |= (1 << sister.index);
+                }
+            }
+
+            SWSS_LOG_NOTICE("EVPN MH ES state: %s active_vteps=%zu → mask=0x%02x (was 0x%02x)",
+                            es_port.c_str(), active_vtep_set.size(),
+                            new_mask, state.active_sister_mask);
+
+            sai_status_t status = updateHwFrrActiveSisters(es_port, new_mask);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("EVPN MH ES state: failed to update active sisters for %s (status=%d)",
+                               es_port.c_str(), status);
+                /* Leave in m_toSync for retry */
+                ++it;
+                continue;
+            }
+        }
+        else if (op == DEL_COMMAND)
+        {
+            /* ES gone — all sisters down */
+            auto state_it = m_hwFrrState.find(es_port);
+            if (state_it != m_hwFrrState.end())
+            {
+                SWSS_LOG_NOTICE("EVPN MH ES state: %s removed — marking all sisters down",
+                                es_port.c_str());
+                updateHwFrrActiveSisters(es_port, 0);
+            }
+        }
+
+        it = consumer.m_toSync.erase(it);
+    }
+}
+
+/*
+ * Query FRR for the list of active remote VTEPs on a given ES port.
+ * Returns a set of VTEP IP strings from `show evpn es detail`.
+ * Used by HW FRR to determine the active sister mask.
+ */
+std::set<std::string> EvpnMhOrch::getActiveRemoteVteps(const std::string &port_name)
+{
+    SWSS_LOG_ENTER();
+    std::set<std::string> result;
+
+    std::string cmd = "vtysh -c 'show evpn es detail' 2>/dev/null";
+    FILE *fp = popen(cmd.c_str(), "r");
+    if (!fp)
+    {
+        SWSS_LOG_ERROR("getActiveRemoteVteps: failed to run vtysh for port %s", port_name.c_str());
+        return result;
+    }
+
+    char buf[512];
+    bool in_matching_es = false;
+    bool in_vteps_section = false;
+
+    while (fgets(buf, sizeof(buf), fp))
+    {
+        std::string line(buf);
+
+        if (line.find("ESI:") != std::string::npos)
+        {
+            if (in_matching_es)
+                break;
+            in_matching_es = false;
+            in_vteps_section = false;
+        }
+
+        if (line.find("Interface:") != std::string::npos)
+        {
+            auto colon_pos = line.find(':');
+            if (colon_pos != std::string::npos)
+            {
+                std::string intf = line.substr(colon_pos + 1);
+                intf.erase(0, intf.find_first_not_of(" \t"));
+                intf.erase(intf.find_last_not_of(" \t\r\n") + 1);
+                if (intf == port_name)
+                    in_matching_es = true;
+            }
+        }
+
+        if (!in_matching_es)
+            continue;
+
+        if (line.find("VTEPs:") != std::string::npos)
+        {
+            in_vteps_section = true;
+            continue;
+        }
+
+        if (in_vteps_section)
+        {
+            std::string trimmed = line;
+            trimmed.erase(0, trimmed.find_first_not_of(" \t"));
+            trimmed.erase(trimmed.find_last_not_of(" \t\r\n") + 1);
+
+            if (trimmed.empty() || trimmed.find(':') != std::string::npos)
+            {
+                in_vteps_section = false;
+            }
+            else
+            {
+                /* VTEP line may include flags like "10.1.0.4 df-preference: 0" */
+                auto space = trimmed.find(' ');
+                std::string vtep_ip = (space != std::string::npos) ?
+                    trimmed.substr(0, space) : trimmed;
+                result.insert(vtep_ip);
+            }
+        }
+    }
+
+    pclose(fp);
+    SWSS_LOG_NOTICE("getActiveRemoteVteps: port %s has %zu active remote VTEPs",
+                    port_name.c_str(), result.size());
+    return result;
+}
+
 /*
  * Check if the peer VTEP still has the Ethernet Segment active by querying
  * FRR's zebra EVPN ES detail table.  We look for the ES block matching the
@@ -799,4 +1073,580 @@ bool EvpnMhOrch::isPeerEsActive(const std::string &port_name)
     SWSS_LOG_NOTICE("isPeerEsActive: port %s peer ES active = %s",
         port_name.c_str(), has_remote_vtep ? "yes" : "no");
     return has_remote_vtep;
+}
+
+/*
+ * HW FRR Protection Groups — Boot-time provisioning
+ *
+ * For an ES port with N sisters, creates:
+ *   - N tunnel nexthops (one per sister VTEP)
+ *   - 2^N - 1 HW_PROTECTION NHGs (one per non-empty subset of sisters)
+ *   - For each server IP:
+ *       - 1 local nexthop
+ *       - 1 PROTECTION NHG (PRIMARY=local, STANDBY=all-sisters NHG)
+ *       - 1 /32 route in VRF → PROTECTION NHG
+ */
+sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
+{
+    SWSS_LOG_ENTER();
+
+    /* Gather sister VTEPs: prefer peer_vteps list, fall back to single peer_vtep */
+    std::vector<std::string> sister_ips;
+    auto vtep_list_it = m_esPeerVtepList.find(es_port);
+    if (vtep_list_it != m_esPeerVtepList.end() && !vtep_list_it->second.empty())
+    {
+        sister_ips = vtep_list_it->second;
+    }
+    else
+    {
+        auto vtep_it = m_esPeerVtep.find(es_port);
+        if (vtep_it != m_esPeerVtep.end() && !vtep_it->second.empty())
+        {
+            sister_ips.push_back(vtep_it->second);
+        }
+    }
+
+    if (sister_ips.empty())
+    {
+        SWSS_LOG_ERROR("HW FRR: no peer VTEPs for ES port %s", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    uint8_t N = static_cast<uint8_t>(sister_ips.size());
+    if (N > 7)
+    {
+        SWSS_LOG_ERROR("HW FRR: too many sisters (%u) for ES port %s, max 7",
+                       N, es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    auto server_ips = getServerIpsForEsPort(es_port);
+    if (server_ips.empty())
+    {
+        SWSS_LOG_ERROR("HW FRR: no server_ipv4 for ES port %s", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    /* Get VRF OID for route programming */
+    sai_object_id_t vrf_oid = getVrfOidForEsPort(es_port);
+    if (vrf_oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_ERROR("HW FRR: no VRF for ES port %s", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    /* Get VLAN RIF for local nexthop */
+    Port es_port_obj;
+    if (!gPortsOrch->getPort(es_port, es_port_obj))
+    {
+        SWSS_LOG_ERROR("HW FRR: port %s not found", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    /* Find the VLAN this port is a member of */
+    vlan_members_t vlan_members;
+    gPortsOrch->getPortVlanMembers(es_port_obj, vlan_members);
+    sai_object_id_t vlan_rif_oid = SAI_NULL_OBJECT_ID;
+    std::string vlan_alias;
+    for (const auto &member : vlan_members)
+    {
+        vlan_alias = std::string(VLAN_PREFIX) + std::to_string(member.first);
+        Port vlan;
+        if (gPortsOrch->getPort(vlan_alias, vlan) && vlan.m_rif_id != SAI_NULL_OBJECT_ID)
+        {
+            vlan_rif_oid = vlan.m_rif_id;
+            break;
+        }
+    }
+    if (vlan_rif_oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_ERROR("HW FRR: no VLAN RIF for ES port %s", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    /* Get PortChannel SAI OID for MONITORED_OBJECT */
+    sai_object_id_t pc_oid = es_port_obj.m_lag_id;
+    if (pc_oid == SAI_NULL_OBJECT_ID)
+    {
+        /* Not a LAG — use the port OID directly */
+        pc_oid = es_port_obj.m_port_id;
+    }
+
+    SWSS_LOG_NOTICE("HW FRR: creating protection groups for ES port %s: "
+                    "%u sisters, %zu server IPs, VRF 0x%" PRIx64 ", RIF 0x%" PRIx64,
+                    es_port.c_str(), N, server_ips.size(), vrf_oid, vlan_rif_oid);
+
+    /* Initialize per-ES state */
+    EsHwFrrState &state = m_hwFrrState[es_port];
+    state.es_port = es_port;
+    state.sisters.clear();
+    state.nhg_subsets.clear();
+    state.prot_groups.clear();
+
+    /* Step 1: Create tunnel nexthops for each sister */
+    for (uint8_t i = 0; i < N; i++)
+    {
+        sai_object_id_t nh_oid = getL3TunnelNexthop(sister_ips[i]);
+        if (nh_oid == SAI_NULL_OBJECT_ID)
+        {
+            SWSS_LOG_ERROR("HW FRR: failed to create tunnel NH for sister %s",
+                           sister_ips[i].c_str());
+            removeHwFrrProtectionGroups(es_port);
+            return SAI_STATUS_FAILURE;
+        }
+
+        SisterVtep sister;
+        sister.vtep_ip = IpAddress(sister_ips[i]);
+        sister.nh_tunnel_oid = nh_oid;
+        sister.index = i;
+        state.sisters.push_back(sister);
+
+        SWSS_LOG_NOTICE("HW FRR: sister[%u] = %s → NH 0x%" PRIx64,
+                        i, sister_ips[i].c_str(), nh_oid);
+    }
+
+    /* Step 2: Pre-provision 2^N - 1 HW_PROTECTION NHGs (all non-empty subsets) */
+    uint8_t all_mask = static_cast<uint8_t>((1 << N) - 1);
+    for (uint8_t mask = 1; mask <= all_mask; mask++)
+    {
+        /* Create HW_PROTECTION NHG */
+        sai_attribute_t nhg_attr;
+        nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+        nhg_attr.value.s32 = SAI_NEXT_HOP_GROUP_TYPE_HW_PROTECTION;
+
+        sai_object_id_t nhg_oid;
+        sai_status_t status = sai_next_hop_group_api->create_next_hop_group(
+            &nhg_oid, gSwitchId, 1, &nhg_attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("HW FRR: failed to create HW_PROTECTION NHG for mask 0x%02x (status=%d)",
+                           mask, status);
+            removeHwFrrProtectionGroups(es_port);
+            return status;
+        }
+
+        HwProtNhg &subset = state.nhg_subsets[mask];
+        subset.sister_mask = mask;
+        subset.nhg_oid = nhg_oid;
+
+        /* Add members for each sister in this subset */
+        for (uint8_t i = 0; i < N; i++)
+        {
+            if (!(mask & (1 << i)))
+                continue;
+
+            std::vector<sai_attribute_t> mbr_attrs;
+            sai_attribute_t attr;
+
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
+            attr.value.oid = nhg_oid;
+            mbr_attrs.push_back(attr);
+
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+            attr.value.oid = state.sisters[i].nh_tunnel_oid;
+            mbr_attrs.push_back(attr);
+
+            sai_object_id_t mbr_oid;
+            status = sai_next_hop_group_api->create_next_hop_group_member(
+                &mbr_oid, gSwitchId,
+                static_cast<uint32_t>(mbr_attrs.size()),
+                mbr_attrs.data());
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("HW FRR: failed to create NHG member for mask 0x%02x sister %u (status=%d)",
+                               mask, i, status);
+                removeHwFrrProtectionGroups(es_port);
+                return status;
+            }
+            subset.member_oids.push_back(mbr_oid);
+        }
+
+        SWSS_LOG_NOTICE("HW FRR: NHG[0x%02x] = 0x%" PRIx64 " with %zu members",
+                        mask, nhg_oid, subset.member_oids.size());
+    }
+
+    /* Step 3: For each server IP, create PROTECTION NHG + route */
+    state.active_sister_mask = all_mask;
+
+    for (const auto &server_ip : server_ips)
+    {
+        HwFrrProtectionGroup prot;
+        prot.server_ip = server_ip;
+        prot.nh_original_oid = SAI_NULL_OBJECT_ID;
+        prot.owns_local_nh = false;
+        prot.owns_route = false;
+
+        /* 3a. Get local nexthop — borrow from neighorch if available,
+         *     else create our own (IP type, via VLAN RIF) */
+        {
+            std::string ip_str = server_ip.getIp().to_string();
+            IpAddress server_addr(ip_str);
+            NextHopKey nh_key(server_addr, vlan_alias);
+
+            if (gNeighOrch->hasNextHop(nh_key))
+            {
+                prot.nh_local_oid = gNeighOrch->getNextHopId(nh_key);
+                prot.owns_local_nh = false;
+                SWSS_LOG_NOTICE("HW FRR: borrowed local NH for %s from neighorch → 0x%" PRIx64,
+                                ip_str.c_str(), prot.nh_local_oid);
+            }
+            else
+            {
+                /* Neighbor not yet resolved — create our own NH */
+                sai_ip_address_t sai_ip;
+                sai_ip.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+                inet_pton(AF_INET, ip_str.c_str(), &sai_ip.addr.ip4);
+
+                std::vector<sai_attribute_t> nh_attrs;
+                sai_attribute_t attr;
+
+                attr.id = SAI_NEXT_HOP_ATTR_TYPE;
+                attr.value.s32 = SAI_NEXT_HOP_TYPE_IP;
+                nh_attrs.push_back(attr);
+
+                attr.id = SAI_NEXT_HOP_ATTR_IP;
+                attr.value.ipaddr = sai_ip;
+                nh_attrs.push_back(attr);
+
+                attr.id = SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID;
+                attr.value.oid = vlan_rif_oid;
+                nh_attrs.push_back(attr);
+
+                sai_status_t status = sai_next_hop_api->create_next_hop(
+                    &prot.nh_local_oid, gSwitchId,
+                    static_cast<uint32_t>(nh_attrs.size()),
+                    nh_attrs.data());
+                if (status != SAI_STATUS_SUCCESS)
+                {
+                    SWSS_LOG_ERROR("HW FRR: failed to create local NH for %s (status=%d)",
+                                   ip_str.c_str(), status);
+                    removeHwFrrProtectionGroups(es_port);
+                    return status;
+                }
+                prot.owns_local_nh = true;
+                SWSS_LOG_NOTICE("HW FRR: created local NH for %s → 0x%" PRIx64 " (no neighbor yet)",
+                                ip_str.c_str(), prot.nh_local_oid);
+            }
+        }
+
+        /* 3b. Create PROTECTION NHG */
+        {
+            sai_attribute_t nhg_attr;
+            nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+            nhg_attr.value.s32 = SAI_NEXT_HOP_GROUP_TYPE_PROTECTION;
+
+            sai_status_t status = sai_next_hop_group_api->create_next_hop_group(
+                &prot.prot_nhg_oid, gSwitchId, 1, &nhg_attr);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("HW FRR: failed to create PROTECTION NHG for %s (status=%d)",
+                               server_ip.to_string().c_str(), status);
+                removeHwFrrProtectionGroups(es_port);
+                return status;
+            }
+        }
+
+        /* 3c. Create PRIMARY member (local NH, monitored by PortChannel) */
+        {
+            std::vector<sai_attribute_t> mbr_attrs;
+            sai_attribute_t attr;
+
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
+            attr.value.oid = prot.prot_nhg_oid;
+            mbr_attrs.push_back(attr);
+
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+            attr.value.oid = prot.nh_local_oid;
+            mbr_attrs.push_back(attr);
+
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_CONFIGURED_ROLE;
+            attr.value.s32 = SAI_NEXT_HOP_GROUP_MEMBER_CONFIGURED_ROLE_PRIMARY;
+            mbr_attrs.push_back(attr);
+
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_MONITORED_OBJECT;
+            attr.value.oid = pc_oid;
+            mbr_attrs.push_back(attr);
+
+            sai_status_t status = sai_next_hop_group_api->create_next_hop_group_member(
+                &prot.primary_member_oid, gSwitchId,
+                static_cast<uint32_t>(mbr_attrs.size()),
+                mbr_attrs.data());
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("HW FRR: failed to create PRIMARY member (status=%d)", status);
+                removeHwFrrProtectionGroups(es_port);
+                return status;
+            }
+        }
+
+        /* 3d. Create STANDBY member → HW_PROTECTION NHG with all sisters */
+        {
+            std::vector<sai_attribute_t> mbr_attrs;
+            sai_attribute_t attr;
+
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
+            attr.value.oid = prot.prot_nhg_oid;
+            mbr_attrs.push_back(attr);
+
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+            attr.value.oid = state.nhg_subsets[all_mask].nhg_oid;
+            mbr_attrs.push_back(attr);
+
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_CONFIGURED_ROLE;
+            attr.value.s32 = SAI_NEXT_HOP_GROUP_MEMBER_CONFIGURED_ROLE_STANDBY;
+            mbr_attrs.push_back(attr);
+
+            sai_status_t status = sai_next_hop_group_api->create_next_hop_group_member(
+                &prot.standby_member_oid, gSwitchId,
+                static_cast<uint32_t>(mbr_attrs.size()),
+                mbr_attrs.data());
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("HW FRR: failed to create STANDBY member (status=%d)", status);
+                removeHwFrrProtectionGroups(es_port);
+                return status;
+            }
+        }
+
+        /* 3e. Create /32 route in VRF → PROTECTION NHG.
+         *     The /32 host path currently comes from the SAI neighbor entry
+         *     (ARP adjacency), not a SAI route. We create a new route entry
+         *     pointing to our PROTECTION NHG. VPP's FIB gives API-sourced
+         *     routes higher priority than adjacency-sourced paths, so our
+         *     route will be used for forwarding.
+         *     The primary member of the PROTECTION NHG uses the same NH OID
+         *     as the neighbor entry, so traffic flows identically in the
+         *     normal (non-failover) case. */
+        {
+            sai_route_entry_t route_entry;
+            route_entry.switch_id = gSwitchId;
+            route_entry.vr_id = vrf_oid;
+            route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+
+            std::string ip_str = server_ip.getIp().to_string();
+            inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
+
+            std::string mask_str = server_ip.getMask().to_string();
+            inet_pton(AF_INET, mask_str.c_str(), &route_entry.destination.mask.ip4);
+
+            prot.owns_route = true;
+
+            sai_attribute_t route_attr;
+            route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+            route_attr.value.oid = prot.prot_nhg_oid;
+
+            sai_status_t status = sai_route_api->create_route_entry(
+                &route_entry, 1, &route_attr);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("HW FRR: failed to create route %s → PROTECTION NHG (status=%d)",
+                               server_ip.to_string().c_str(), status);
+                removeHwFrrProtectionGroups(es_port);
+                return status;
+            }
+            SWSS_LOG_NOTICE("HW FRR: created route %s → prot_nhg=0x%" PRIx64
+                            " (local_nh=0x%" PRIx64 " %s)",
+                            server_ip.to_string().c_str(), prot.prot_nhg_oid,
+                            prot.nh_local_oid,
+                            prot.owns_local_nh ? "self-created" : "borrowed");
+        }
+
+        SWSS_LOG_NOTICE("HW FRR: PROTECTION group for %s: prot_nhg=0x%" PRIx64
+                        " local_nh=0x%" PRIx64 " standby→NHG[0x%02x]",
+                        server_ip.to_string().c_str(), prot.prot_nhg_oid,
+                        prot.nh_local_oid, all_mask);
+
+        state.prot_groups.push_back(prot);
+    }
+
+    SWSS_LOG_NOTICE("HW FRR: ES port %s fully provisioned: %u sisters, %u NHG subsets, "
+                    "%zu PROTECTION groups",
+                    es_port.c_str(), N, all_mask, state.prot_groups.size());
+    return SAI_STATUS_SUCCESS;
+}
+
+/*
+ * HW FRR — Remove all protection groups for an ES port.
+ * Tears down in reverse order: routes, PROTECTION NHG members/NHGs,
+ * HW_PROTECTION NHG members/NHGs, local NHs.
+ * Tunnel NHs are shared (via m_l3TunnelNexthops) and NOT removed here.
+ */
+sai_status_t EvpnMhOrch::removeHwFrrProtectionGroups(const std::string &es_port)
+{
+    SWSS_LOG_ENTER();
+
+    auto state_it = m_hwFrrState.find(es_port);
+    if (state_it == m_hwFrrState.end())
+    {
+        SWSS_LOG_NOTICE("HW FRR: no state to remove for ES port %s", es_port.c_str());
+        return SAI_STATUS_SUCCESS;
+    }
+
+    EsHwFrrState &state = state_it->second;
+
+    /* Remove routes and PROTECTION NHGs (per-server) */
+    sai_object_id_t vrf_oid = getVrfOidForEsPort(es_port);
+
+    for (auto &prot : state.prot_groups)
+    {
+        /* Remove route (we always create it, so always delete) */
+        if (vrf_oid != SAI_NULL_OBJECT_ID)
+        {
+            sai_route_entry_t route_entry;
+            route_entry.switch_id = gSwitchId;
+            route_entry.vr_id = vrf_oid;
+            route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+
+            std::string ip_str = prot.server_ip.getIp().to_string();
+            inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
+            std::string mask_str = prot.server_ip.getMask().to_string();
+            inet_pton(AF_INET, mask_str.c_str(), &route_entry.destination.mask.ip4);
+
+            sai_route_api->remove_route_entry(&route_entry);
+        }
+
+        /* Remove PROTECTION NHG members, then NHG */
+        if (prot.standby_member_oid != SAI_NULL_OBJECT_ID)
+            sai_next_hop_group_api->remove_next_hop_group_member(prot.standby_member_oid);
+        if (prot.primary_member_oid != SAI_NULL_OBJECT_ID)
+            sai_next_hop_group_api->remove_next_hop_group_member(prot.primary_member_oid);
+        if (prot.prot_nhg_oid != SAI_NULL_OBJECT_ID)
+            sai_next_hop_group_api->remove_next_hop_group(prot.prot_nhg_oid);
+
+        /* Remove local NH only if we created it (not borrowed from neighorch) */
+        if (prot.owns_local_nh && prot.nh_local_oid != SAI_NULL_OBJECT_ID)
+            sai_next_hop_api->remove_next_hop(prot.nh_local_oid);
+    }
+
+    /* Remove all HW_PROTECTION NHG subsets */
+    for (auto &kv : state.nhg_subsets)
+    {
+        auto &subset = kv.second;
+        for (auto &mbr_oid : subset.member_oids)
+        {
+            sai_next_hop_group_api->remove_next_hop_group_member(mbr_oid);
+        }
+        sai_next_hop_group_api->remove_next_hop_group(subset.nhg_oid);
+    }
+
+    SWSS_LOG_NOTICE("HW FRR: removed all protection groups for ES port %s "
+                    "(%zu PROTECTION groups, %zu NHG subsets)",
+                    es_port.c_str(), state.prot_groups.size(), state.nhg_subsets.size());
+
+    m_hwFrrState.erase(state_it);
+    return SAI_STATUS_SUCCESS;
+}
+
+/*
+ * HW FRR — Update the active sister mask for an ES port.
+ * Called when a sister's ES state changes (BGP Type-1 withdrawal/advertisement).
+ * Swaps each PROTECTION group's STANDBY member to point to the NHG subset
+ * matching the new active mask.
+ *
+ * This is O(M) where M = number of server IPs per ES port (typically 1-2).
+ * Each update is a single SAI attribute set — no member add/remove.
+ */
+sai_status_t EvpnMhOrch::updateHwFrrActiveSisters(
+    const std::string &es_port,
+    uint8_t new_active_mask)
+{
+    SWSS_LOG_ENTER();
+
+    auto state_it = m_hwFrrState.find(es_port);
+    if (state_it == m_hwFrrState.end())
+    {
+        SWSS_LOG_WARN("HW FRR: no state for ES port %s", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    EsHwFrrState &state = state_it->second;
+    uint8_t old_mask = state.active_sister_mask;
+
+    if (new_active_mask == old_mask)
+    {
+        SWSS_LOG_NOTICE("HW FRR: active mask unchanged (0x%02x) for %s",
+                        old_mask, es_port.c_str());
+        return SAI_STATUS_SUCCESS;
+    }
+
+    SWSS_LOG_NOTICE("HW FRR: updating active sisters for %s: 0x%02x → 0x%02x",
+                    es_port.c_str(), old_mask, new_active_mask);
+
+    if (new_active_mask == 0)
+    {
+        SWSS_LOG_WARN("HW FRR: ALL sisters down for ES port %s — no backup path!",
+                      es_port.c_str());
+        /* We can't point STANDBY to an empty NHG. Keep pointing to old mask —
+         * traffic will black-hole on local failure, but that's the expected
+         * behavior when all sisters are down. */
+        state.active_sister_mask = 0;
+        return SAI_STATUS_SUCCESS;
+    }
+
+    /* Validate the new mask has a pre-provisioned NHG */
+    auto nhg_it = state.nhg_subsets.find(new_active_mask);
+    if (nhg_it == state.nhg_subsets.end())
+    {
+        SWSS_LOG_ERROR("HW FRR: no pre-provisioned NHG for mask 0x%02x on %s",
+                       new_active_mask, es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    sai_object_id_t new_nhg_oid = nhg_it->second.nhg_oid;
+
+    /* Swap STANDBY member on each PROTECTION group */
+    for (auto &prot : state.prot_groups)
+    {
+        sai_attribute_t attr;
+        attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+        attr.value.oid = new_nhg_oid;
+
+        sai_status_t status = sai_next_hop_group_api->set_next_hop_group_member_attribute(
+            prot.standby_member_oid, &attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("HW FRR: failed to swap STANDBY for %s to NHG[0x%02x] (status=%d)",
+                           prot.server_ip.to_string().c_str(), new_active_mask, status);
+            return status;
+        }
+
+        SWSS_LOG_NOTICE("HW FRR: swapped STANDBY for %s → NHG[0x%02x] (0x%" PRIx64 ")",
+                        prot.server_ip.to_string().c_str(), new_active_mask, new_nhg_oid);
+    }
+
+    state.active_sister_mask = new_active_mask;
+    return SAI_STATUS_SUCCESS;
+}
+
+/*
+ * Refresh the active sister mask for an ES port by querying FRR directly.
+ * This is the pull-based alternative to the EVPN_MH_ES_STATE_TABLE push path.
+ * Can be called periodically or on specific events (e.g., FDB changes).
+ */
+sai_status_t EvpnMhOrch::refreshHwFrrSisterState(const std::string &es_port)
+{
+    SWSS_LOG_ENTER();
+
+    auto state_it = m_hwFrrState.find(es_port);
+    if (state_it == m_hwFrrState.end())
+    {
+        return SAI_STATUS_SUCCESS;  /* Not an HW FRR port */
+    }
+
+    EsHwFrrState &state = state_it->second;
+
+    /* Query FRR for active remote VTEPs */
+    std::set<std::string> active_vteps = getActiveRemoteVteps(es_port);
+
+    /* Convert to bitmask */
+    uint8_t new_mask = 0;
+    for (const auto &sister : state.sisters)
+    {
+        if (active_vteps.count(sister.vtep_ip.to_string()))
+        {
+            new_mask |= (1 << sister.index);
+        }
+    }
+
+    return updateHwFrrActiveSisters(es_port, new_mask);
 }

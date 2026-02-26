@@ -43,6 +43,7 @@ FdbSync::FdbSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector
     }
 
     m_evpnMhNeighTable = std::make_unique<ProducerStateTable>(pipelineAppDB, "EVPN_MH_NEIGH_TABLE");
+    m_evpnMhEsStateTable = std::make_unique<ProducerStateTable>(pipelineAppDB, "EVPN_MH_ES_STATE_TABLE");
 }
 
 FdbSync::~FdbSync()
@@ -1501,4 +1502,48 @@ void FdbSync::onNeighborEvent(struct nlmsghdr *msg)
         SWSS_LOG_NOTICE("EVPN_MH_NEIGH_TABLE: SET %s mac=%s proto=%u ext_flags=0x%x",
             key.c_str(), mac_buf, protocol, ext_flags);
     }
+}
+
+/*
+ * Update the ES remote VTEP state in APPL_DB for a given ES port.
+ * Called when the set of active remote VTEPs changes (sister add/remove).
+ * Produces to EVPN_MH_ES_STATE_TABLE for evpnmhorch consumption.
+ *
+ * Key: es_port (e.g. "PortChannel0")
+ * Fields:
+ *   active_vteps: comma-separated list of currently active sister VTEP IPs
+ */
+void FdbSync::updateEsRemoteVteps(const std::string &es_port,
+                                   const std::set<std::string> &vteps)
+{
+    auto &cached = m_esRemoteVteps[es_port];
+    if (cached == vteps)
+    {
+        return; /* No change */
+    }
+
+    cached = vteps;
+
+    if (vteps.empty())
+    {
+        SWSS_LOG_NOTICE("EVPN_MH_ES_STATE_TABLE: DEL %s (no remote VTEPs)", es_port.c_str());
+        m_evpnMhEsStateTable->del(es_port);
+        return;
+    }
+
+    /* Build comma-separated VTEP list */
+    std::string vtep_list;
+    for (const auto &v : vteps)
+    {
+        if (!vtep_list.empty())
+            vtep_list += ",";
+        vtep_list += v;
+    }
+
+    std::vector<FieldValueTuple> fvs;
+    fvs.emplace_back("active_vteps", vtep_list);
+
+    SWSS_LOG_NOTICE("EVPN_MH_ES_STATE_TABLE: SET %s active_vteps=%s",
+                    es_port.c_str(), vtep_list.c_str());
+    m_evpnMhEsStateTable->set(es_port, fvs);
 }

@@ -1651,7 +1651,17 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
         if (gEvpnMhOrch && gEvpnMhOrch->isPortInterfaceAssociatedToEs(p.m_alias))
         {
             auto mode = gEvpnMhOrch->getEffectiveFailoverMode(p.m_alias);
-            if (mode == EvpnMhFailoverMode::L3)
+            if (mode == EvpnMhFailoverMode::HW)
+            {
+                /* HW FRR: ASIC handles failover via PROTECTION NHG MONITORED_OBJECT.
+                 * No software intervention needed — the ASIC auto-switches to STANDBY
+                 * path when the monitored PortChannel goes down.
+                 * FRR handles BGP Type-1 AD-per-ES withdrawal independently. */
+                SWSS_LOG_NOTICE("EVPN MH HW failover: port %s down — ASIC handles via PROTECTION NHG, "
+                    "no SW intervention", p.m_alias.c_str());
+                return;
+            }
+            else if (mode == EvpnMhFailoverMode::L3)
             {
                 SWSS_LOG_NOTICE("EVPN MH L3 failover: port %s is ES member, injecting host routes",
                     p.m_alias.c_str());
@@ -1695,6 +1705,16 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
          * back to the local port from the VxLAN tunnel. */
         if (gEvpnMhOrch && gEvpnMhOrch->isPortInterfaceAssociatedToEs(p.m_alias))
         {
+            auto mode = gEvpnMhOrch->getEffectiveFailoverMode(p.m_alias);
+            if (mode == EvpnMhFailoverMode::HW)
+            {
+                /* HW FRR: ASIC auto-restores to PRIMARY when MONITORED_OBJECT comes back up.
+                 * No software intervention needed. */
+                SWSS_LOG_NOTICE("EVPN MH HW restore: port %s up — ASIC auto-restores via PROTECTION NHG",
+                    p.m_alias.c_str());
+                return;
+            }
+
             /* Withdraw L3 host routes if any were injected */
             if (m_l3ReroutedEntries.find(p.m_alias) != m_l3ReroutedEntries.end() &&
                 !m_l3ReroutedEntries[p.m_alias].empty())
