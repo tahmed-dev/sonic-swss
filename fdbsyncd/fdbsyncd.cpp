@@ -25,7 +25,7 @@ int main(int argc, char **argv)
 
     NetDispatcher::getInstance().registerMessageHandler(RTM_NEWNEIGH, &sync);
     NetDispatcher::getInstance().registerMessageHandler(RTM_DELNEIGH, &sync);
-    NetDispatcher::getInstance().registerMessageHandler(RTM_NEWLINK, &sync);
+    NetDispatcher::getInstance().registerRawMessageHandler(RTM_NEWLINK, &sync);
     NetDispatcher::getInstance().registerRawMessageHandler(RTM_NEWNEXTHOP, &sync);
     NetDispatcher::getInstance().registerRawMessageHandler(RTM_DELNEXTHOP, &sync);
 
@@ -89,9 +89,20 @@ int main(int argc, char **argv)
 
             netlink.dumpRequest(RTM_GETNEXTHOP);
 
+            /* libnl can't parse RTM_NEWNEXTHOP dump responses (NLE_MSGTYPE_NOSUPPORT),
+             * so scan existing FDB NHGs via ip command instead */
+            sync.scanExistingNhgs();
+
             s.addSelectable(sync.getFdbStateTable());
             s.addSelectable(sync.getMclagRemoteFdbStateTable());
             s.addSelectable(sync.getCfgEvpnNvoTable());
+
+            /* Race-free NVO initialization: subscribe FIRST (above),
+             * then do the direct lookup. Any entry that appears between
+             * subscription and lookup is caught by both paths (idempotent).
+             * This closes the TOCTOU window. */
+            sync.checkExistingEvpnNvo();
+
             while (true)
             {
                 s.select(&temps);

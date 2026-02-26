@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <memory>
 #include <arpa/inet.h>
@@ -91,10 +92,13 @@ public:
     void processStateMclagRemoteFdb();
 
     void processCfgEvpnNvo();
+    void checkExistingEvpnNvo();
 
     bool m_reconcileDone = false;
 
     bool m_isEvpnNvoExist = false;
+
+    void scanExistingNhgs();
 
 private:
     ProducerStateTable m_fdbTable;
@@ -104,6 +108,7 @@ private:
     SubscriberStateTable m_mclagRemoteFdbStateTable;
     AppRestartAssist  *m_AppRestartAssist;
     SubscriberStateTable m_cfgEvpnNvoTable;
+    DBConnector *m_cfgDb;
 
     /* EVPN MH neighbor cache: maps "Vlan<N>:<IP>" → {mac, flags} */
     struct EvpnMhNeighEntry {
@@ -116,7 +121,14 @@ private:
     /* APPL_DB table for EVPN MH neighbors */
     std::unique_ptr<ProducerStateTable> m_evpnMhNeighTable;
 
+    /* APPL_DB table for EVPN MH ES state (remote VTEP list per ES port) */
+    std::unique_ptr<ProducerStateTable> m_evpnMhEsStateTable;
+
+    /* Cached ES remote VTEP state: es_port → set of active VTEP IPs */
+    std::map<std::string, std::set<std::string>> m_esRemoteVteps;
+
     void onNeighborEvent(struct nlmsghdr *msg);
+    void updateEsRemoteVteps(const std::string &es_port, const std::set<std::string> &vteps);
 
     struct m_local_fdb_info
     {
@@ -191,6 +203,8 @@ private:
     void onMsgNbr(int nlmsg_type, struct nl_object *obj);
     void onMsgNbrRaw(struct nlmsghdr *msg);
     void onMsgLink(int nlmsg_type, struct nl_object *obj);
+    void onMsgLinkRaw(struct nlmsghdr *msg);
+    void onMsgLinkVxlan(struct nlmsghdr *msg);
     void onMsgNhg(struct nlmsghdr *msg);
 
     enum L2NhgType {
@@ -205,6 +219,15 @@ private:
         std::vector<uint32_t> member_ids;   /* For GROUP type */
     };
     std::unordered_map<uint32_t, l2_nhg_info> m_l2NhgMap;
+
+    /* NHG group ID → ES port name mapping (populated from FRR) */
+    std::unordered_map<uint32_t, std::string> m_nhgToEsPort;
+
+    /* Query FRR via vtysh to build NHG→ES port mapping */
+    void refreshEsNhgMapping();
+
+    /* Resolve VTEP IPs from a group NHG's members and update ES state */
+    void resolveNhgGroupVteps(uint32_t nhg_id);
 };
 
 }

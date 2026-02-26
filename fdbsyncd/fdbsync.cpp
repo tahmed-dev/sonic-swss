@@ -8,12 +8,16 @@
 #include <netlink/route/link.h>
 #include <netlink/route/neighbour.h>
 #include <netlink/route/link/vxlan.h>
+#include <netlink/msg.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <linux/if_link.h>
+#include <linux/rtnetlink.h>
 
 #include "logger.h"
 #include "dbconnector.h"
 #include "producerstatetable.h"
+#include "table.h"
 #include "ipaddress.h"
 #include "netmsg.h"
 #include "macaddress.h"
@@ -33,7 +37,8 @@ FdbSync::FdbSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector
     m_l2NhgTable(pipelineAppDB, APP_L2_NEXTHOP_GROUP_TABLE_NAME),
     m_fdbStateTable(stateDb, STATE_FDB_TABLE_NAME),
     m_mclagRemoteFdbStateTable(stateDb, STATE_MCLAG_REMOTE_FDB_TABLE_NAME),
-    m_cfgEvpnNvoTable(config_db, CFG_VXLAN_EVPN_NVO_TABLE_NAME)
+    m_cfgEvpnNvoTable(config_db, CFG_VXLAN_EVPN_NVO_TABLE_NAME),
+    m_cfgDb(config_db)
 {
     m_AppRestartAssist = new AppRestartAssist(pipelineAppDB, "fdbsyncd", "swss", DEFAULT_FDBSYNC_WARMSTART_TIMER);
     if (m_AppRestartAssist)
@@ -43,6 +48,7 @@ FdbSync::FdbSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector
     }
 
     m_evpnMhNeighTable = std::make_unique<ProducerStateTable>(pipelineAppDB, "EVPN_MH_NEIGH_TABLE");
+    m_evpnMhEsStateTable = std::make_unique<ProducerStateTable>(pipelineAppDB, "EVPN_MH_ES_STATE_TABLE");
 }
 
 FdbSync::~FdbSync()
@@ -80,6 +86,32 @@ bool FdbSync::isIntfRestoreDone()
     }
     
     return true;
+}
+
+void FdbSync::checkExistingEvpnNvo()
+{
+    /*
+     * Direct CONFIG_DB lookup for pre-existing NVO config.
+     *
+     * SubscriberStateTable only notifies on changes after subscription.
+     * If NVO was configured before fdbsyncd starts, the flag stays false.
+     *
+     * Race-free ordering: the caller must subscribe (addSelectable on
+     * m_cfgEvpnNvoTable) BEFORE calling this method. That way:
+     *  - Entries created before subscription → caught by this lookup
+     *  - Entries created after subscription  → caught by processCfgEvpnNvo
+     *  - Entries created between sub & lookup → caught by BOTH (idempotent)
+     */
+    Table nvoTable(m_cfgDb, CFG_VXLAN_EVPN_NVO_TABLE_NAME);
+    std::vector<std::string> keys;
+    nvoTable.getKeys(keys);
+    if (!keys.empty())
+    {
+        SWSS_LOG_NOTICE("checkExistingEvpnNvo: found %zu existing NVO entries, enabling EVPN NVO",
+                        keys.size());
+        m_isEvpnNvoExist = true;
+        updateAllLocalMac();
+    }
 }
 
 void FdbSync::processCfgEvpnNvo()
@@ -1046,6 +1078,9 @@ void FdbSync::onMsg(int nlmsg_type, struct nl_object *obj)
 
 void FdbSync::onMsgNhg(struct nlmsghdr *msg)
 {
+    SWSS_LOG_NOTICE("onMsgNhg: received nlmsg_type=%d len=%u",
+                    msg->nlmsg_type, msg->nlmsg_len);
+
     struct nhmsg *nhm = (struct nhmsg *)NLMSG_DATA(msg);
     int len = (int)(msg->nlmsg_len - NLMSG_LENGTH(sizeof(*nhm)));
 
@@ -1152,7 +1187,7 @@ void FdbSync::onMsgNhg(struct nlmsghdr *msg)
             info.vtep_ip = ip_string;
             m_l2NhgMap[nhid] = info;
 
-            SWSS_LOG_INFO("L2_NEXTHOP_GROUP_TABLE: ADD nhid=%u remote_vtep=%s", nhid, ip_string.c_str());
+            SWSS_LOG_NOTICE("L2_NEXTHOP_GROUP_TABLE: ADD nhid=%u remote_vtep=%s", nhid, ip_string.c_str());
         }
         else if (has_group && grp != NULL && grp_count > 0)
         {
@@ -1188,16 +1223,31 @@ void FdbSync::onMsgNhg(struct nlmsghdr *msg)
             info.member_ids = member_ids;
             m_l2NhgMap[nhid] = info;
 
-            SWSS_LOG_INFO("L2_NEXTHOP_GROUP_TABLE: ADD nhid=%u nexthop_group=%s", nhid, nhg_str.c_str());
+            SWSS_LOG_NOTICE("L2_NEXTHOP_GROUP_TABLE: ADD nhid=%u nexthop_group=%s", nhid, nhg_str.c_str());
+
+            /* Resolve VTEP IPs and update ES state for this group */
+            resolveNhgGroupVteps(nhid);
         }
     }
     else if (msg->nlmsg_type == RTM_DELNEXTHOP)
     {
+        /* If this is a group NHG being deleted, clear its ES state first */
+        auto del_it = m_l2NhgMap.find(nhid);
+        if (del_it != m_l2NhgMap.end() && del_it->second.type == L2_NHG_TYPE_GROUP)
+        {
+            auto es_it = m_nhgToEsPort.find(nhid);
+            if (es_it != m_nhgToEsPort.end())
+            {
+                std::set<std::string> empty;
+                updateEsRemoteVteps(es_it->second, empty);
+            }
+        }
+
         /* Delete from L2_NEXTHOP_GROUP_TABLE */
         m_l2NhgTable.del(to_string(nhid));
         m_l2NhgMap.erase(nhid);
 
-        SWSS_LOG_INFO("L2_NEXTHOP_GROUP_TABLE: DEL nhid=%u", nhid);
+        SWSS_LOG_NOTICE("L2_NEXTHOP_GROUP_TABLE: DEL nhid=%u", nhid);
 
         /* Update any GROUP entries that reference this deleted NHG ID */
         std::vector<uint32_t> groups_to_delete;
@@ -1235,16 +1285,27 @@ void FdbSync::onMsgNhg(struct nlmsghdr *msg)
                 fvVector.push_back(fv);
                 m_l2NhgTable.set(to_string(entry.first), fvVector);
 
-                SWSS_LOG_INFO("L2_NEXTHOP_GROUP_TABLE: UPDATE nhid=%u nexthop_group=%s", entry.first, nhg_str.c_str());
+                SWSS_LOG_NOTICE("L2_NEXTHOP_GROUP_TABLE: UPDATE nhid=%u nexthop_group=%s", entry.first, nhg_str.c_str());
+
+                /* Re-resolve VTEP IPs after member removal */
+                resolveNhgGroupVteps(entry.first);
             }
         }
 
         /* Delete empty groups */
         for (auto gid : groups_to_delete)
         {
+            /* Resolve before erasing — sends empty VTEP set (DEL) to ES state table */
+            auto es_it = m_nhgToEsPort.find(gid);
+            if (es_it != m_nhgToEsPort.end())
+            {
+                std::set<std::string> empty;
+                updateEsRemoteVteps(es_it->second, empty);
+            }
+
             m_l2NhgTable.del(to_string(gid));
             m_l2NhgMap.erase(gid);
-            SWSS_LOG_INFO("L2_NEXTHOP_GROUP_TABLE: DEL empty group nhid=%u", gid);
+            SWSS_LOG_NOTICE("L2_NEXTHOP_GROUP_TABLE: DEL empty group nhid=%u", gid);
         }
     }
 }
@@ -1388,8 +1449,16 @@ void FdbSync::onMsgRaw(struct nlmsghdr *msg)
 
     if (msg->nlmsg_type == RTM_NEWLINK)
     {
-        struct nl_object *obj = (struct nl_object *)NLMSG_DATA(msg);
-        onMsg(msg->nlmsg_type, obj);
+        /* Parse raw for bridge port BACKUP_NHID attribute */
+        onMsgLinkRaw(msg);
+
+        /* Parse raw attributes directly for VxLAN interface tracking.
+         * We cannot rely on nlmsg_convert + nl_msg_parse because libnl
+         * fails to parse RTM_NEWLINK messages that were reconstructed
+         * from raw nlmsghdr bytes (loses internal message metadata).
+         * This was the root cause of m_intf_info never being populated
+         * for VxLAN interfaces like vtep1-10. */
+        onMsgLinkVxlan(msg);
     }
     else if (msg->nlmsg_type == RTM_NEWNEIGH || msg->nlmsg_type == RTM_DELNEIGH)
     {
@@ -1501,4 +1570,400 @@ void FdbSync::onNeighborEvent(struct nlmsghdr *msg)
         SWSS_LOG_NOTICE("EVPN_MH_NEIGH_TABLE: SET %s mac=%s proto=%u ext_flags=0x%x",
             key.c_str(), mac_buf, protocol, ext_flags);
     }
+}
+
+/*
+ * Update the ES remote VTEP state in APPL_DB for a given ES port.
+ * Called when the set of active remote VTEPs changes (sister add/remove).
+ * Produces to EVPN_MH_ES_STATE_TABLE for evpnmhorch consumption.
+ *
+ * Key: es_port (e.g. "PortChannel0")
+ * Fields:
+ *   active_vteps: comma-separated list of currently active sister VTEP IPs
+ */
+void FdbSync::updateEsRemoteVteps(const std::string &es_port,
+                                   const std::set<std::string> &vteps)
+{
+    auto &cached = m_esRemoteVteps[es_port];
+    if (cached == vteps)
+    {
+        return; /* No change */
+    }
+
+    cached = vteps;
+
+    if (vteps.empty())
+    {
+        SWSS_LOG_NOTICE("EVPN_MH_ES_STATE_TABLE: DEL %s (no remote VTEPs)", es_port.c_str());
+        m_evpnMhEsStateTable->del(es_port);
+        return;
+    }
+
+    /* Build comma-separated VTEP list */
+    std::string vtep_list;
+    for (const auto &v : vteps)
+    {
+        if (!vtep_list.empty())
+            vtep_list += ",";
+        vtep_list += v;
+    }
+
+    std::vector<FieldValueTuple> fvs;
+    fvs.emplace_back("active_vteps", vtep_list);
+
+    SWSS_LOG_NOTICE("EVPN_MH_ES_STATE_TABLE: SET %s active_vteps=%s",
+                    es_port.c_str(), vtep_list.c_str());
+    m_evpnMhEsStateTable->set(es_port, fvs);
+}
+
+/*
+ * Query FRR via vtysh to build NHG group ID → ES port mapping.
+ * Parses 'show evpn es json' output to extract nhgId and interface per ES.
+ *
+ * Example FRR JSON:
+ * {
+ *   "03:00:00:00:00:01:01:00:00:01": {
+ *     "type": "Local,Remote",
+ *     "interface": "PortChannel0",
+ *     "nhgId": 536870913,
+ *     "vteps": [{"vtep": "10.1.0.2", ...}]
+ *   }
+ * }
+ */
+/*
+ * Parse RTM_NEWLINK for bridge port attributes.
+ * Extracts IFLA_BRPORT_BACKUP_NHID from IFLA_PROTINFO to build
+ * the NHG group ID → ES port name mapping.
+ *
+ * FRR's zebra sends this when an ES is created/updated on a bond.
+ */
+#ifndef IFLA_BRPORT_BACKUP_NHID
+#define IFLA_BRPORT_BACKUP_NHID 44
+#endif
+
+/*
+ * Parse RTM_NEWLINK raw attributes to detect VxLAN interfaces and populate m_intf_info.
+ * This replaces the broken nlmsg_convert + nl_msg_parse + rtnl_link_is_vxlan path.
+ * Looks for IFLA_LINKINFO → IFLA_INFO_KIND == "vxlan" → IFLA_INFO_DATA → IFLA_VXLAN_ID.
+ */
+void FdbSync::onMsgLinkVxlan(struct nlmsghdr *msg)
+{
+    struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(msg);
+    int len = (int)(msg->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi)));
+
+    if (len < 0)
+        return;
+
+    /* Skip AF_BRIDGE family — those don't carry IFLA_LINKINFO */
+    if (ifi->ifi_family == AF_BRIDGE)
+        return;
+
+    int ifindex = ifi->ifi_index;
+    char ifname_buf[IF_NAMESIZE] = {};
+    bool is_vxlan = false;
+    uint32_t vni = 0;
+
+    /* Parse top-level attributes */
+    struct rtattr *rta = IFLA_RTA(ifi);
+    for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len))
+    {
+        if (rta->rta_type == IFLA_IFNAME)
+        {
+            size_t name_len = RTA_PAYLOAD(rta);
+            if (name_len > 0 && name_len < IF_NAMESIZE)
+            {
+                memcpy(ifname_buf, RTA_DATA(rta), name_len);
+                ifname_buf[name_len - 1] = '\0'; /* ensure null-termination */
+            }
+        }
+        else if (rta->rta_type == IFLA_LINKINFO)
+        {
+            /* Parse nested IFLA_INFO_KIND and IFLA_INFO_DATA */
+            struct rtattr *li_rta = (struct rtattr *)RTA_DATA(rta);
+            int li_len = (int)RTA_PAYLOAD(rta);
+            struct rtattr *info_data = nullptr;
+            int info_data_len = 0;
+
+            for (; RTA_OK(li_rta, li_len); li_rta = RTA_NEXT(li_rta, li_len))
+            {
+                if (li_rta->rta_type == IFLA_INFO_KIND)
+                {
+                    const char *kind = (const char *)RTA_DATA(li_rta);
+                    if (strncmp(kind, "vxlan", 5) == 0)
+                    {
+                        is_vxlan = true;
+                    }
+                }
+                else if (li_rta->rta_type == IFLA_INFO_DATA)
+                {
+                    info_data = (struct rtattr *)RTA_DATA(li_rta);
+                    info_data_len = (int)RTA_PAYLOAD(li_rta);
+                }
+            }
+
+            /* Extract VNI from IFLA_INFO_DATA if this is a vxlan interface */
+            if (is_vxlan && info_data)
+            {
+                struct rtattr *vx_rta = info_data;
+                int vx_len = info_data_len;
+                for (; RTA_OK(vx_rta, vx_len); vx_rta = RTA_NEXT(vx_rta, vx_len))
+                {
+                    /* IFLA_VXLAN_ID = 1 */
+                    if (vx_rta->rta_type == 1 && RTA_PAYLOAD(vx_rta) >= sizeof(uint32_t))
+                    {
+                        vni = *(uint32_t *)RTA_DATA(vx_rta);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!is_vxlan || vni == 0)
+        return;
+
+    /* Resolve ifname if not found in attributes */
+    if (ifname_buf[0] == '\0')
+    {
+        if (if_indextoname(ifindex, ifname_buf) == nullptr)
+        {
+            SWSS_LOG_WARN("onMsgLinkVxlan: cannot resolve ifindex %d", ifindex);
+            return;
+        }
+    }
+
+    SWSS_LOG_NOTICE("onMsgLinkVxlan: VxLAN dev %s ifindex %d vni %u",
+                    ifname_buf, ifindex, vni);
+    m_intf_info[ifindex].vni    = vni;
+    m_intf_info[ifindex].ifname = ifname_buf;
+}
+
+void FdbSync::onMsgLinkRaw(struct nlmsghdr *msg)
+{
+    struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(msg);
+    int len = (int)(msg->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi)));
+
+    if (len < 0)
+        return;
+
+    /* Only interested in AF_BRIDGE family (bridge port updates) */
+    if (ifi->ifi_family != AF_BRIDGE)
+        return;
+
+    /* Parse top-level attributes looking for IFLA_PROTINFO */
+    struct rtattr *rta = IFLA_RTA(ifi);
+    uint32_t backup_nhg_id = 0;
+    bool found_nhid = false;
+
+    for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len))
+    {
+        if (rta->rta_type == (IFLA_PROTINFO | NLA_F_NESTED) ||
+            rta->rta_type == IFLA_PROTINFO)
+        {
+            /* Parse nested bridge port attributes */
+            struct rtattr *br_rta = (struct rtattr *)RTA_DATA(rta);
+            int br_len = (int)RTA_PAYLOAD(rta);
+
+            for (; RTA_OK(br_rta, br_len); br_rta = RTA_NEXT(br_rta, br_len))
+            {
+                if (br_rta->rta_type == IFLA_BRPORT_BACKUP_NHID)
+                {
+                    backup_nhg_id = *(uint32_t *)RTA_DATA(br_rta);
+                    found_nhid = true;
+                }
+            }
+        }
+    }
+
+    if (!found_nhid || backup_nhg_id == 0)
+        return;
+
+    /* Resolve ifindex → interface name */
+    char ifname[IF_NAMESIZE];
+    if (if_indextoname(ifi->ifi_index, ifname) == nullptr)
+    {
+        SWSS_LOG_WARN("onMsgLinkRaw: cannot resolve ifindex %d", ifi->ifi_index);
+        return;
+    }
+
+    std::string port_name(ifname);
+
+    /* Update NHG→ES port mapping */
+    auto it = m_nhgToEsPort.find(backup_nhg_id);
+    if (it != m_nhgToEsPort.end() && it->second == port_name)
+    {
+        return; /* No change */
+    }
+
+    m_nhgToEsPort[backup_nhg_id] = port_name;
+    SWSS_LOG_NOTICE("onMsgLinkRaw: NHG %u → ES port %s (ifindex %d)",
+                    backup_nhg_id, port_name.c_str(), ifi->ifi_index);
+
+    /* If we already have this NHG group in m_l2NhgMap, resolve VTEPs now */
+    resolveNhgGroupVteps(backup_nhg_id);
+}
+
+void FdbSync::refreshEsNhgMapping()
+{
+    /* NHG→ES port mapping is now driven by kernel RTM_NEWLINK events
+     * carrying IFLA_BRPORT_BACKUP_NHID (sent by FRR zebra).
+     * This function is a no-op fallback — the mapping is populated
+     * by onMsgLinkRaw() as bridge port updates arrive. */
+    SWSS_LOG_INFO("refreshEsNhgMapping: mapping driven by kernel IFLA_BRPORT_BACKUP_NHID events");
+}
+
+/*
+ * Scan existing kernel FDB nexthops at startup.
+ * libnl's RTM_GETNEXTHOP dump fails with NLE_MSGTYPE_NOSUPPORT (-25),
+ * so we parse `ip nexthop show fdb` output instead.
+ *
+ * Format examples:
+ *   id 268435459 via 10.1.0.2 scope link fdb
+ *   id 536870913 group 268435459 fdb
+ *   id 536870914 group 268435459/268435460 fdb
+ */
+void FdbSync::scanExistingNhgs()
+{
+    SWSS_LOG_NOTICE("scanExistingNhgs: scanning kernel FDB nexthops");
+
+    FILE *fp = popen("ip nexthop show fdb 2>/dev/null", "r");
+    if (!fp)
+    {
+        SWSS_LOG_WARN("scanExistingNhgs: failed to run ip nexthop show fdb");
+        return;
+    }
+
+    char buf[1024];
+    int vtep_count = 0, group_count = 0;
+
+    while (fgets(buf, sizeof(buf), fp) != nullptr)
+    {
+        std::string line(buf);
+
+        /* Parse "id <N>" */
+        size_t id_pos = line.find("id ");
+        if (id_pos == std::string::npos)
+            continue;
+
+        uint32_t nhid = (uint32_t)strtoul(line.c_str() + id_pos + 3, nullptr, 10);
+        if (nhid == 0)
+            continue;
+
+        /* Check for "via <IP>" (individual VTEP NH) */
+        size_t via_pos = line.find("via ");
+        if (via_pos != std::string::npos)
+        {
+            size_t ip_start = via_pos + 4;
+            size_t ip_end = line.find_first_of(" \t\n", ip_start);
+            std::string ip_str = line.substr(ip_start, ip_end - ip_start);
+
+            /* Store as VTEP type */
+            l2_nhg_info info;
+            info.type = L2_NHG_TYPE_VTEP;
+            info.vtep_ip = ip_str;
+            m_l2NhgMap[nhid] = info;
+
+            SWSS_LOG_NOTICE("scanExistingNhgs: VTEP nhid=%u ip=%s",
+                            nhid, ip_str.c_str());
+            vtep_count++;
+            continue;
+        }
+
+        /* Check for "group <id>[/<id>...]" (group NH) */
+        size_t grp_pos = line.find("group ");
+        if (grp_pos != std::string::npos)
+        {
+            size_t grp_start = grp_pos + 6;
+            size_t grp_end = line.find_first_of(" \t\n", grp_start);
+            std::string grp_str = line.substr(grp_start, grp_end - grp_start);
+
+            /* Parse member IDs (slash-separated) */
+            l2_nhg_info info;
+            info.type = L2_NHG_TYPE_GROUP;
+
+            size_t pos = 0;
+            std::string nhg_members_str;
+            while (pos < grp_str.size())
+            {
+                size_t slash = grp_str.find('/', pos);
+                std::string member_str;
+                if (slash == std::string::npos)
+                {
+                    member_str = grp_str.substr(pos);
+                    pos = grp_str.size();
+                }
+                else
+                {
+                    member_str = grp_str.substr(pos, slash - pos);
+                    pos = slash + 1;
+                }
+
+                uint32_t member_id = (uint32_t)strtoul(member_str.c_str(), nullptr, 10);
+                if (member_id > 0)
+                {
+                    info.member_ids.push_back(member_id);
+                    if (!nhg_members_str.empty())
+                        nhg_members_str += ",";
+                    nhg_members_str += to_string(member_id);
+                }
+            }
+
+            m_l2NhgMap[nhid] = info;
+
+            SWSS_LOG_NOTICE("scanExistingNhgs: GROUP nhid=%u members=[%s]",
+                            nhid, nhg_members_str.c_str());
+            group_count++;
+        }
+    }
+    pclose(fp);
+
+    SWSS_LOG_NOTICE("scanExistingNhgs: found %d VTEPs, %d groups",
+                    vtep_count, group_count);
+}
+
+/*
+ * Resolve the VTEP IPs from a group NHG's member list and call
+ * updateEsRemoteVteps() for the corresponding ES port.
+ */
+void FdbSync::resolveNhgGroupVteps(uint32_t nhg_id)
+{
+    auto grp_it = m_l2NhgMap.find(nhg_id);
+    if (grp_it == m_l2NhgMap.end() || grp_it->second.type != L2_NHG_TYPE_GROUP)
+    {
+        return;
+    }
+
+    /* Look up ES port for this NHG group */
+    auto es_it = m_nhgToEsPort.find(nhg_id);
+    if (es_it == m_nhgToEsPort.end())
+    {
+        /* Try refreshing the mapping from FRR */
+        refreshEsNhgMapping();
+        es_it = m_nhgToEsPort.find(nhg_id);
+        if (es_it == m_nhgToEsPort.end())
+        {
+            SWSS_LOG_NOTICE("resolveNhgGroupVteps: NHG %u not mapped to any ES port", nhg_id);
+            return;
+        }
+    }
+
+    const std::string &es_port = es_it->second;
+
+    /* Resolve member NHG IDs to VTEP IPs */
+    std::set<std::string> vtep_set;
+    for (uint32_t member_id : grp_it->second.member_ids)
+    {
+        auto member_it = m_l2NhgMap.find(member_id);
+        if (member_it != m_l2NhgMap.end() &&
+            member_it->second.type == L2_NHG_TYPE_VTEP &&
+            !member_it->second.vtep_ip.empty())
+        {
+            vtep_set.insert(member_it->second.vtep_ip);
+        }
+    }
+
+    SWSS_LOG_NOTICE("resolveNhgGroupVteps: NHG %u (ES %s) → %zu active VTEPs",
+                    nhg_id, es_port.c_str(), vtep_set.size());
+
+    updateEsRemoteVteps(es_port, vtep_set);
 }

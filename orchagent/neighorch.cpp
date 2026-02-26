@@ -8,6 +8,7 @@
 #include "muxorch.h"
 #include "subscriberstatetable.h"
 #include "nhgorch.h"
+#include "evpnmhorch.h"
 
 extern sai_neighbor_api_t*         sai_neighbor_api;
 extern sai_next_hop_api_t*         sai_next_hop_api;
@@ -22,6 +23,7 @@ extern Directory<Orch*> gDirectory;
 extern string gMySwitchType;
 extern int32_t gVoqMySwitchId;
 extern BfdOrch *gBfdOrch;
+extern EvpnMhOrch *gEvpnMhOrch;
 extern size_t gMaxBulkSize;
 extern string gMyHostName;
 
@@ -1375,6 +1377,29 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
     if (mux_orch)
     {
         is_nbr_active = mux_orch->isNeighborActive(ip_address, macAddress, alias);
+    }
+
+    /* EVPN MH HW FRR: suppress automatic /32 host route for server IPs
+     * behind ES ports with HW failover mode.  The /32 route is owned
+     * exclusively by evpnmhorch's PROTECTION NHG. */
+    if (gEvpnMhOrch && gEvpnMhOrch->isHwFrrServerIp(ip_address))
+    {
+        /* Check if NO_HOST_ROUTE was already added (e.g. by link-local check) */
+        bool already_set = false;
+        for (auto const &a : neighbor_attrs)
+        {
+            if (a.id == SAI_NEIGHBOR_ENTRY_ATTR_NO_HOST_ROUTE)
+            {
+                already_set = true;
+                break;
+            }
+        }
+        if (!already_set)
+        {
+            no_host_route = true;
+            SWSS_LOG_NOTICE("EVPN MH HW FRR: setting NO_HOST_ROUTE for server IP %s on %s",
+                            ip_address.to_string().c_str(), alias.c_str());
+        }
     }
 
     if (no_host_route)
