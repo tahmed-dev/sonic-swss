@@ -72,6 +72,11 @@ public:
                                           uint8_t new_active_mask);
     sai_status_t refreshHwFrrSisterState(const std::string &es_port);
 
+    /* HW FRR local port failover: swap routes to tunnel on port down,
+     * restore to PROTECTION NHG on port up.  Called by fdborch. */
+    sai_status_t handleHwFrrLocalPortDown(const std::string &es_port);
+    sai_status_t handleHwFrrLocalPortUp(const std::string &es_port);
+
     /* Check if the peer VTEP still has the ES active (via FRR zebra) */
     bool isPeerEsActive(const std::string &port_name);
 
@@ -88,6 +93,7 @@ private:
     /* Per-ES peer VTEP IP (sister T1) from config — enables pre-provisioning
      * of tunnels, arp-term entries, and L3 nexthops at init time */
     std::map<std::string, std::string> m_esPeerVtep;
+    std::map<std::string, std::string> m_esSysMac;
     std::map<std::string, std::vector<std::string>> m_esPeerVtepList; /* HW FRR: ordered sister VTEP IPs */
 
     /* Per-ES server IPs from config — static mapping of port → server overlay IPs

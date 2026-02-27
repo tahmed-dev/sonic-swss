@@ -339,7 +339,42 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
                         }
                     }
                 }
+                else if (fvField(i) == "es_sys_mac")
+                {
+                    m_esSysMac[key] = fvValue(i);
+                    SWSS_LOG_NOTICE("EVPN MH: es_sys_mac for %s set to %s",
+                        key.c_str(), fvValue(i).c_str());
+                }
             }
+
+            /*
+             * Apply ES system MAC to the PortChannel interface.
+             *
+             * Both T1s in an EVPN MH Ethernet Segment must share the same
+             * LACP actor system MAC on the PortChannel.  Without this, LACP
+             * PDUs from each T1 carry different system IDs and the server
+             * treats them as separate LAGs instead of a multi-chassis LAG.
+             *
+             * The MAC is set at the kernel level (ip link set) which
+             * propagates to VPP via LCP sync.
+             */
+            auto sys_mac_it = m_esSysMac.find(key);
+            if (sys_mac_it != m_esSysMac.end() && !sys_mac_it->second.empty())
+            {
+                string cmd = "ip link set " + key + " address " + sys_mac_it->second;
+                int ret = system(cmd.c_str());
+                if (ret == 0)
+                {
+                    SWSS_LOG_NOTICE("EVPN MH: set %s MAC to %s (es_sys_mac)",
+                        key.c_str(), sys_mac_it->second.c_str());
+                }
+                else
+                {
+                    SWSS_LOG_WARN("EVPN MH: failed to set %s MAC to %s (ret=%d)",
+                        key.c_str(), sys_mac_it->second.c_str(), ret);
+                }
+            }
+
             if (!vlanMembersApplyNonDF(key))
             {
                 // SAI operation failed — ES is registered but DF state
@@ -1649,4 +1684,147 @@ sai_status_t EvpnMhOrch::refreshHwFrrSisterState(const std::string &es_port)
     }
 
     return updateHwFrrActiveSisters(es_port, new_mask);
+}
+
+/*
+ * HW FRR — Handle local port down event.
+ * VPP doesn't natively implement MONITORED_OBJECT for PROTECTION NHGs,
+ * so we do it in software: swap each server IP route from the PROTECTION NHG
+ * (which has the now-unreachable local primary path) to the standby
+ * HW_PROTECTION NHG (tunnel-only paths to sister T1s).
+ *
+ * Called by fdborch when an ES port (PortChannel) goes operationally down.
+ */
+sai_status_t EvpnMhOrch::handleHwFrrLocalPortDown(const std::string &es_port)
+{
+    SWSS_LOG_ENTER();
+
+    auto state_it = m_hwFrrState.find(es_port);
+    if (state_it == m_hwFrrState.end())
+    {
+        SWSS_LOG_WARN("HW FRR port down: no state for %s", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    EsHwFrrState &state = state_it->second;
+    sai_object_id_t vrf_oid = getVrfOidForEsPort(es_port);
+    if (vrf_oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_ERROR("HW FRR port down: no VRF for %s", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    /* Find the standby NHG to route through */
+    uint8_t standby_mask = state.active_sister_mask;
+    if (standby_mask == 0)
+    {
+        /* Use the full mask (all sisters) as fallback — traffic will
+         * black-hole at the tunnel endpoint if sisters are also down,
+         * but at least the local path is definitively unreachable. */
+        for (const auto &sister : state.sisters)
+            standby_mask |= (1 << sister.index);
+    }
+
+    auto nhg_it = state.nhg_subsets.find(standby_mask);
+    if (nhg_it == state.nhg_subsets.end())
+    {
+        SWSS_LOG_ERROR("HW FRR port down: no NHG for mask 0x%02x on %s",
+                       standby_mask, es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    sai_object_id_t standby_nhg_oid = nhg_it->second.nhg_oid;
+
+    for (auto &prot : state.prot_groups)
+    {
+        /* Swap the /32 route to point directly to the standby NHG (tunnel only) */
+        sai_route_entry_t route_entry;
+        route_entry.switch_id = gSwitchId;
+        route_entry.vr_id = vrf_oid;
+        route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+
+        std::string ip_str = prot.server_ip.getIp().to_string();
+        std::string mask_str = prot.server_ip.getMask().to_string();
+        inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
+        inet_pton(AF_INET, mask_str.c_str(), &route_entry.destination.mask.ip4);
+
+        sai_attribute_t route_attr;
+        route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+        route_attr.value.oid = standby_nhg_oid;
+
+        sai_status_t status = sai_route_api->set_route_entry_attribute(
+            &route_entry, &route_attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("HW FRR port down: failed to swap route %s to standby NHG "
+                           "(status=%d)", prot.server_ip.to_string().c_str(), status);
+            continue;
+        }
+
+        SWSS_LOG_NOTICE("HW FRR port down: %s route %s → standby NHG[0x%02x] (0x%" PRIx64 ")",
+                        es_port.c_str(), prot.server_ip.to_string().c_str(),
+                        standby_mask, standby_nhg_oid);
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+/*
+ * HW FRR — Handle local port up event.
+ * Restore each server IP route to the full PROTECTION NHG (which includes
+ * the local primary path via BVI).
+ *
+ * Called by fdborch when an ES port (PortChannel) comes back up.
+ */
+sai_status_t EvpnMhOrch::handleHwFrrLocalPortUp(const std::string &es_port)
+{
+    SWSS_LOG_ENTER();
+
+    auto state_it = m_hwFrrState.find(es_port);
+    if (state_it == m_hwFrrState.end())
+    {
+        SWSS_LOG_WARN("HW FRR port up: no state for %s", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    EsHwFrrState &state = state_it->second;
+    sai_object_id_t vrf_oid = getVrfOidForEsPort(es_port);
+    if (vrf_oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_ERROR("HW FRR port up: no VRF for %s", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    for (auto &prot : state.prot_groups)
+    {
+        /* Restore the /32 route to the full PROTECTION NHG */
+        sai_route_entry_t route_entry;
+        route_entry.switch_id = gSwitchId;
+        route_entry.vr_id = vrf_oid;
+        route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+
+        std::string ip_str = prot.server_ip.getIp().to_string();
+        std::string mask_str = prot.server_ip.getMask().to_string();
+        inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
+        inet_pton(AF_INET, mask_str.c_str(), &route_entry.destination.mask.ip4);
+
+        sai_attribute_t route_attr;
+        route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+        route_attr.value.oid = prot.prot_nhg_oid;
+
+        sai_status_t status = sai_route_api->set_route_entry_attribute(
+            &route_entry, &route_attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("HW FRR port up: failed to restore route %s to PROTECTION NHG "
+                           "(status=%d)", prot.server_ip.to_string().c_str(), status);
+            continue;
+        }
+
+        SWSS_LOG_NOTICE("HW FRR port up: %s route %s → PROTECTION NHG (0x%" PRIx64 ")",
+                        es_port.c_str(), prot.server_ip.to_string().c_str(),
+                        prot.prot_nhg_oid);
+    }
+
+    return SAI_STATUS_SUCCESS;
 }
