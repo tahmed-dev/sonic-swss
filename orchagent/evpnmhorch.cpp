@@ -292,8 +292,8 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
                 }
                 else if (fvField(i) == "peer_vteps")
                 {
-                    /* Comma-separated list of sister T1 VTEP IPs for HW FRR.
-                     * Order defines bitmask indexing: sister[0]=bit 0, etc. */
+                    /* Comma-separated list of peer T1 VTEP IPs for HW FRR.
+                     * Order defines bitmask indexing: peer[0]=bit 0, etc. */
                     m_esPeerVtepList[key].clear();
                     string vteps_str = fvValue(i);
                     stringstream ss(vteps_str);
@@ -809,13 +809,12 @@ bool EvpnMhOrch::isHwFrrServerIp(const IpAddress &ip)
  * Process EVPN_MH_ES_STATE_TABLE updates from fdbsyncd.
  * Key: <es_port> (e.g. "PortChannel0")
  * Fields:
- *   active_vteps: comma-separated list of currently active sister VTEP IPs
+ *   active_vteps: comma-separated list of currently active peer VTEP IPs
  *
  * This is triggered when fdbsyncd detects ES remote VTEP changes via FRR
- * (BGP Type-1 AD-per-ES route add/withdraw from sisters).
+ * (BGP EVPN Type-4 ES route add/withdraw from peers).
  *
- * Converts the active VTEP list to a bitmask using the configured sister
- * ordering (from peer_vteps), then calls updateHwFrrActiveSisters().
+ * Calls updateHwFrrStandbyEcmp() to reprogram the standby ECMP NHG members.
  */
 void EvpnMhOrch::doEvpnMhEsStateTask(Consumer &consumer)
 {
@@ -841,8 +840,6 @@ void EvpnMhOrch::doEvpnMhEsStateTask(Consumer &consumer)
                 continue;
             }
 
-            EsHwFrrState &state = state_it->second;
-
             /* Parse active_vteps field */
             std::set<std::string> active_vtep_set;
             for (const auto &fv : kfvFieldsValues(t))
@@ -861,39 +858,28 @@ void EvpnMhOrch::doEvpnMhEsStateTask(Consumer &consumer)
                 }
             }
 
-            /* Convert VTEP IPs to bitmask using configured sister ordering */
-            uint8_t new_mask = 0;
-            for (const auto &sister : state.sisters)
-            {
-                if (active_vtep_set.count(sister.vtep_ip.to_string()))
-                {
-                    new_mask |= (1 << sister.index);
-                }
-            }
+            SWSS_LOG_NOTICE("EVPN MH ES state: %s active_vteps=%zu",
+                            es_port.c_str(), active_vtep_set.size());
 
-            SWSS_LOG_NOTICE("EVPN MH ES state: %s active_vteps=%zu → mask=0x%02x (was 0x%02x)",
-                            es_port.c_str(), active_vtep_set.size(),
-                            new_mask, state.active_sister_mask);
-
-            sai_status_t status = updateHwFrrActiveSisters(es_port, new_mask);
+            sai_status_t status = updateHwFrrStandbyEcmp(es_port, active_vtep_set);
             if (status != SAI_STATUS_SUCCESS)
             {
-                SWSS_LOG_ERROR("EVPN MH ES state: failed to update active sisters for %s (status=%d)",
+                SWSS_LOG_ERROR("EVPN MH ES state: failed to update standby ECMP for %s (status=%d)",
                                es_port.c_str(), status);
-                /* Leave in m_toSync for retry */
                 ++it;
                 continue;
             }
         }
         else if (op == DEL_COMMAND)
         {
-            /* ES gone — all sisters down */
+            /* ES gone — all peers down, clear standby ECMP */
             auto state_it = m_hwFrrState.find(es_port);
             if (state_it != m_hwFrrState.end())
             {
-                SWSS_LOG_NOTICE("EVPN MH ES state: %s removed — marking all sisters down",
+                SWSS_LOG_NOTICE("EVPN MH ES state: %s removed — clearing standby ECMP",
                                 es_port.c_str());
-                updateHwFrrActiveSisters(es_port, 0);
+                std::set<std::string> empty;
+                updateHwFrrStandbyEcmp(es_port, empty);
             }
         }
 
@@ -904,7 +890,7 @@ void EvpnMhOrch::doEvpnMhEsStateTask(Consumer &consumer)
 /*
  * Query FRR for the list of active remote VTEPs on a given ES port.
  * Returns a set of VTEP IP strings from `show evpn es detail`.
- * Used by HW FRR to determine the active sister mask.
+ * Used by HW FRR to determine the active peer mask.
  */
 std::set<std::string> EvpnMhOrch::getActiveRemoteVteps(const std::string &port_name)
 {
@@ -1111,47 +1097,43 @@ bool EvpnMhOrch::isPeerEsActive(const std::string &port_name)
 }
 
 /*
- * HW FRR Protection Groups — Boot-time provisioning
+ * HW FRR Protection Groups — Per-ES provisioning
  *
- * For an ES port with N sisters, creates:
- *   - N tunnel nexthops (one per sister VTEP)
- *   - 2^N - 1 HW_PROTECTION NHGs (one per non-empty subset of sisters)
- *   - For each server IP:
- *       - 1 local nexthop
- *       - 1 PROTECTION NHG (PRIMARY=local, STANDBY=all-sisters NHG)
- *       - 1 /32 route in VRF → PROTECTION NHG
+ * Each ES port gets ONE PROTECTION NHG:
+ *   - PRIMARY member: local NH (via bvi/VLAN RIF) with MONITORED_OBJECT = PortChannel
+ *   - STANDBY member: ECMP NHG across all peer VTEP tunnel NHs
+ *
+ * All server /32 routes on this ES point to the same PROTECTION NHG.
+ *
+ * On link failure:
+ *   1. ASIC instantly switches to standby ECMP NHG (MONITORED_OBJECT)
+ *   2. BGP EVPN Type-4 update → reprogram standby ECMP NHG members
+ *
+ * Tunnel NHs are shared across ES ports via m_l3TunnelNexthops.
  */
 sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
 {
     SWSS_LOG_ENTER();
 
-    /* Gather sister VTEPs: prefer peer_vteps list, fall back to single peer_vtep */
-    std::vector<std::string> sister_ips;
+    /* Gather peer VTEPs: prefer peer_vteps list, fall back to single peer_vtep */
+    std::vector<std::string> peer_ips;
     auto vtep_list_it = m_esPeerVtepList.find(es_port);
     if (vtep_list_it != m_esPeerVtepList.end() && !vtep_list_it->second.empty())
     {
-        sister_ips = vtep_list_it->second;
+        peer_ips = vtep_list_it->second;
     }
     else
     {
         auto vtep_it = m_esPeerVtep.find(es_port);
         if (vtep_it != m_esPeerVtep.end() && !vtep_it->second.empty())
         {
-            sister_ips.push_back(vtep_it->second);
+            peer_ips.push_back(vtep_it->second);
         }
     }
 
-    if (sister_ips.empty())
+    if (peer_ips.empty())
     {
         SWSS_LOG_ERROR("HW FRR: no peer VTEPs for ES port %s", es_port.c_str());
-        return SAI_STATUS_FAILURE;
-    }
-
-    uint8_t N = static_cast<uint8_t>(sister_ips.size());
-    if (N > 7)
-    {
-        SWSS_LOG_ERROR("HW FRR: too many sisters (%u) for ES port %s, max 7",
-                       N, es_port.c_str());
         return SAI_STATUS_FAILURE;
     }
 
@@ -1178,7 +1160,6 @@ sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
         return SAI_STATUS_FAILURE;
     }
 
-    /* Find the VLAN this port is a member of */
     vlan_members_t vlan_members;
     gPortsOrch->getPortVlanMembers(es_port_obj, vlan_members);
     sai_object_id_t vlan_rif_oid = SAI_NULL_OBJECT_ID;
@@ -1203,307 +1184,284 @@ sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
     sai_object_id_t pc_oid = es_port_obj.m_lag_id;
     if (pc_oid == SAI_NULL_OBJECT_ID)
     {
-        /* Not a LAG — use the port OID directly */
         pc_oid = es_port_obj.m_port_id;
     }
 
-    SWSS_LOG_NOTICE("HW FRR: creating protection groups for ES port %s: "
-                    "%u sisters, %zu server IPs, VRF 0x%" PRIx64 ", RIF 0x%" PRIx64,
-                    es_port.c_str(), N, server_ips.size(), vrf_oid, vlan_rif_oid);
+    SWSS_LOG_NOTICE("HW FRR: creating protection group for ES port %s: "
+                    "%zu peers, %zu server IPs, VRF 0x%" PRIx64 ", RIF 0x%" PRIx64,
+                    es_port.c_str(), peer_ips.size(),
+                    server_ips.size(), vrf_oid, vlan_rif_oid);
 
     /* Initialize per-ES state */
     EsHwFrrState &state = m_hwFrrState[es_port];
     state.es_port = es_port;
-    state.sisters.clear();
-    state.nhg_subsets.clear();
-    state.prot_groups.clear();
+    state.peers.clear();
+    state.server_routes.clear();
 
-    /* Step 1: Create tunnel nexthops for each sister */
-    for (uint8_t i = 0; i < N; i++)
+    /* ---- Step 1: Create tunnel NHs for each peer VTEP ---- */
+    for (size_t i = 0; i < peer_ips.size(); i++)
     {
-        sai_object_id_t nh_oid = getL3TunnelNexthop(sister_ips[i]);
+        sai_object_id_t nh_oid = getL3TunnelNexthop(peer_ips[i]);
         if (nh_oid == SAI_NULL_OBJECT_ID)
         {
-            SWSS_LOG_ERROR("HW FRR: failed to create tunnel NH for sister %s",
-                           sister_ips[i].c_str());
+            SWSS_LOG_ERROR("HW FRR: failed to create tunnel NH for peer %s",
+                           peer_ips[i].c_str());
             removeHwFrrProtectionGroups(es_port);
             return SAI_STATUS_FAILURE;
         }
 
-        SisterVtep sister;
-        sister.vtep_ip = IpAddress(sister_ips[i]);
-        sister.nh_tunnel_oid = nh_oid;
-        sister.index = i;
-        state.sisters.push_back(sister);
+        PeerVtep peer;
+        peer.vtep_ip = peer_ips[i];
+        peer.nh_tunnel_oid = nh_oid;
+        peer.ecmp_member_oid = SAI_NULL_OBJECT_ID;  // Set when ECMP NHG is created
+        state.peers.push_back(peer);
 
-        SWSS_LOG_NOTICE("HW FRR: sister[%u] = %s → NH 0x%" PRIx64,
-                        i, sister_ips[i].c_str(), nh_oid);
+        SWSS_LOG_NOTICE("HW FRR: peer[%zu] = %s → NH 0x%" PRIx64,
+                        i, peer_ips[i].c_str(), nh_oid);
     }
 
-    /* Step 2: Pre-provision 2^N - 1 HW_PROTECTION NHGs (all non-empty subsets) */
-    uint8_t all_mask = static_cast<uint8_t>((1 << N) - 1);
-    for (uint8_t mask = 1; mask <= all_mask; mask++)
+    /* ---- Step 2: Create standby ECMP NHG with all peer tunnel NHs ---- */
     {
-        /* Create HW_PROTECTION NHG */
         sai_attribute_t nhg_attr;
         nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
-        nhg_attr.value.s32 = SAI_NEXT_HOP_GROUP_TYPE_HW_PROTECTION;
+        nhg_attr.value.s32 = SAI_NEXT_HOP_GROUP_TYPE_ECMP;
 
-        sai_object_id_t nhg_oid;
         sai_status_t status = sai_next_hop_group_api->create_next_hop_group(
-            &nhg_oid, gSwitchId, 1, &nhg_attr);
+            &state.standby_ecmp_nhg_oid, gSwitchId, 1, &nhg_attr);
         if (status != SAI_STATUS_SUCCESS)
         {
-            SWSS_LOG_ERROR("HW FRR: failed to create HW_PROTECTION NHG for mask 0x%02x (status=%d)",
-                           mask, status);
+            SWSS_LOG_ERROR("HW FRR: failed to create standby ECMP NHG (status=%d)", status);
             removeHwFrrProtectionGroups(es_port);
             return status;
         }
 
-        HwProtNhg &subset = state.nhg_subsets[mask];
-        subset.sister_mask = mask;
-        subset.nhg_oid = nhg_oid;
+        SWSS_LOG_NOTICE("HW FRR: standby ECMP NHG = 0x%" PRIx64,
+                        state.standby_ecmp_nhg_oid);
 
-        /* Add members for each sister in this subset */
-        for (uint8_t i = 0; i < N; i++)
+        /* Add each peer as an ECMP member */
+        for (auto &peer : state.peers)
         {
-            if (!(mask & (1 << i)))
-                continue;
-
             std::vector<sai_attribute_t> mbr_attrs;
             sai_attribute_t attr;
 
             attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
-            attr.value.oid = nhg_oid;
+            attr.value.oid = state.standby_ecmp_nhg_oid;
             mbr_attrs.push_back(attr);
 
             attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
-            attr.value.oid = state.sisters[i].nh_tunnel_oid;
+            attr.value.oid = peer.nh_tunnel_oid;
             mbr_attrs.push_back(attr);
 
-            sai_object_id_t mbr_oid;
             status = sai_next_hop_group_api->create_next_hop_group_member(
-                &mbr_oid, gSwitchId,
+                &peer.ecmp_member_oid, gSwitchId,
                 static_cast<uint32_t>(mbr_attrs.size()),
                 mbr_attrs.data());
             if (status != SAI_STATUS_SUCCESS)
             {
-                SWSS_LOG_ERROR("HW FRR: failed to create NHG member for mask 0x%02x sister %u (status=%d)",
-                               mask, i, status);
+                SWSS_LOG_ERROR("HW FRR: failed to add peer %s to ECMP NHG (status=%d)",
+                               peer.vtep_ip.c_str(), status);
                 removeHwFrrProtectionGroups(es_port);
                 return status;
             }
-            subset.member_oids.push_back(mbr_oid);
-        }
 
-        SWSS_LOG_NOTICE("HW FRR: NHG[0x%02x] = 0x%" PRIx64 " with %zu members",
-                        mask, nhg_oid, subset.member_oids.size());
+            SWSS_LOG_NOTICE("HW FRR: ECMP member for %s = 0x%" PRIx64,
+                            peer.vtep_ip.c_str(), peer.ecmp_member_oid);
+        }
     }
 
-    /* Step 3: For each server IP, create PROTECTION NHG + route */
-    state.active_sister_mask = all_mask;
+    /* ---- Step 3: Create local NH for primary path ---- */
+    {
+        /* Use first server IP for the local NH (it resolves via BVI/RIF;
+         * the actual dst IP doesn't matter for PROTECTION selection —
+         * MONITORED_OBJECT drives the primary↔standby switchover). */
+        std::string ip_str = server_ips[0].getIp().to_string();
+        IpAddress server_addr(ip_str);
+        NextHopKey nh_key(server_addr, vlan_alias);
 
+        if (gNeighOrch->hasNextHop(nh_key))
+        {
+            state.nh_local_oid = gNeighOrch->getNextHopId(nh_key);
+            state.owns_local_nh = false;
+            SWSS_LOG_NOTICE("HW FRR: borrowed local NH for %s → 0x%" PRIx64,
+                            ip_str.c_str(), state.nh_local_oid);
+        }
+        else
+        {
+            sai_ip_address_t sai_ip;
+            sai_ip.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+            inet_pton(AF_INET, ip_str.c_str(), &sai_ip.addr.ip4);
+
+            std::vector<sai_attribute_t> nh_attrs;
+            sai_attribute_t attr;
+
+            attr.id = SAI_NEXT_HOP_ATTR_TYPE;
+            attr.value.s32 = SAI_NEXT_HOP_TYPE_IP;
+            nh_attrs.push_back(attr);
+
+            attr.id = SAI_NEXT_HOP_ATTR_IP;
+            attr.value.ipaddr = sai_ip;
+            nh_attrs.push_back(attr);
+
+            attr.id = SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID;
+            attr.value.oid = vlan_rif_oid;
+            nh_attrs.push_back(attr);
+
+            sai_status_t status = sai_next_hop_api->create_next_hop(
+                &state.nh_local_oid, gSwitchId,
+                static_cast<uint32_t>(nh_attrs.size()),
+                nh_attrs.data());
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("HW FRR: failed to create local NH for %s (status=%d)",
+                               ip_str.c_str(), status);
+                removeHwFrrProtectionGroups(es_port);
+                return status;
+            }
+            state.owns_local_nh = true;
+            SWSS_LOG_NOTICE("HW FRR: created local NH for %s → 0x%" PRIx64,
+                            ip_str.c_str(), state.nh_local_oid);
+        }
+    }
+
+    /* ---- Step 4: Create the single PROTECTION NHG for this ES ---- */
+    {
+        sai_attribute_t nhg_attr;
+        nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+        nhg_attr.value.s32 = SAI_NEXT_HOP_GROUP_TYPE_PROTECTION;
+
+        sai_status_t status = sai_next_hop_group_api->create_next_hop_group(
+            &state.prot_nhg_oid, gSwitchId, 1, &nhg_attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("HW FRR: failed to create PROTECTION NHG (status=%d)", status);
+            removeHwFrrProtectionGroups(es_port);
+            return status;
+        }
+
+        SWSS_LOG_NOTICE("HW FRR: PROTECTION NHG = 0x%" PRIx64, state.prot_nhg_oid);
+    }
+
+    /* ---- Step 4a: Create PRIMARY member (local NH, MONITORED_OBJECT = PC) ---- */
+    {
+        std::vector<sai_attribute_t> mbr_attrs;
+        sai_attribute_t attr;
+
+        attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
+        attr.value.oid = state.prot_nhg_oid;
+        mbr_attrs.push_back(attr);
+
+        attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+        attr.value.oid = state.nh_local_oid;
+        mbr_attrs.push_back(attr);
+
+        attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_CONFIGURED_ROLE;
+        attr.value.s32 = SAI_NEXT_HOP_GROUP_MEMBER_CONFIGURED_ROLE_PRIMARY;
+        mbr_attrs.push_back(attr);
+
+        attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_MONITORED_OBJECT;
+        attr.value.oid = pc_oid;
+        mbr_attrs.push_back(attr);
+
+        sai_status_t status = sai_next_hop_group_api->create_next_hop_group_member(
+            &state.primary_member_oid, gSwitchId,
+            static_cast<uint32_t>(mbr_attrs.size()),
+            mbr_attrs.data());
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("HW FRR: failed to create PRIMARY member (status=%d)", status);
+            removeHwFrrProtectionGroups(es_port);
+            return status;
+        }
+    }
+
+    /* ---- Step 4b: Create STANDBY member → standby ECMP NHG ---- */
+    {
+        std::vector<sai_attribute_t> mbr_attrs;
+        sai_attribute_t attr;
+
+        attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
+        attr.value.oid = state.prot_nhg_oid;
+        mbr_attrs.push_back(attr);
+
+        attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+        attr.value.oid = state.standby_ecmp_nhg_oid;
+        mbr_attrs.push_back(attr);
+
+        attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_CONFIGURED_ROLE;
+        attr.value.s32 = SAI_NEXT_HOP_GROUP_MEMBER_CONFIGURED_ROLE_STANDBY;
+        mbr_attrs.push_back(attr);
+
+        sai_status_t status = sai_next_hop_group_api->create_next_hop_group_member(
+            &state.standby_member_oid, gSwitchId,
+            static_cast<uint32_t>(mbr_attrs.size()),
+            mbr_attrs.data());
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("HW FRR: failed to create STANDBY member (status=%d)", status);
+            removeHwFrrProtectionGroups(es_port);
+            return status;
+        }
+    }
+
+    SWSS_LOG_NOTICE("HW FRR: PROTECTION NHG 0x%" PRIx64 ": PRIMARY=0x%" PRIx64
+                    " (local_nh=0x%" PRIx64 " monitored=%s) STANDBY=0x%" PRIx64
+                    " (ecmp_nhg=0x%" PRIx64 " with %zu peers)",
+                    state.prot_nhg_oid, state.primary_member_oid,
+                    state.nh_local_oid, es_port.c_str(),
+                    state.standby_member_oid, state.standby_ecmp_nhg_oid,
+                    state.peers.size());
+
+    /* ---- Step 5: Create /32 routes for all server IPs → same PROTECTION NHG ---- */
     for (const auto &server_ip : server_ips)
     {
-        HwFrrProtectionGroup prot;
-        prot.server_ip = server_ip;
-        prot.nh_original_oid = SAI_NULL_OBJECT_ID;
-        prot.owns_local_nh = false;
-        prot.owns_route = false;
+        HwFrrServerRoute route;
+        route.server_ip = server_ip;
+        route.nh_local_oid = SAI_NULL_OBJECT_ID;  // Not per-server anymore
+        route.owns_local_nh = false;
+        route.owns_route = false;
 
-        /* 3a. Get local nexthop — borrow from neighorch if available,
-         *     else create our own (IP type, via VLAN RIF) */
+        sai_route_entry_t route_entry;
+        route_entry.switch_id = gSwitchId;
+        route_entry.vr_id = vrf_oid;
+        route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+
+        std::string ip_str = server_ip.getIp().to_string();
+        inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
+
+        std::string mask_str = server_ip.getMask().to_string();
+        inet_pton(AF_INET, mask_str.c_str(), &route_entry.destination.mask.ip4);
+
+        sai_attribute_t route_attr;
+        route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+        route_attr.value.oid = state.prot_nhg_oid;
+
+        sai_status_t status = sai_route_api->create_route_entry(
+            &route_entry, 1, &route_attr);
+        if (status != SAI_STATUS_SUCCESS)
         {
-            std::string ip_str = server_ip.getIp().to_string();
-            IpAddress server_addr(ip_str);
-            NextHopKey nh_key(server_addr, vlan_alias);
-
-            if (gNeighOrch->hasNextHop(nh_key))
-            {
-                prot.nh_local_oid = gNeighOrch->getNextHopId(nh_key);
-                prot.owns_local_nh = false;
-                SWSS_LOG_NOTICE("HW FRR: borrowed local NH for %s from neighorch → 0x%" PRIx64,
-                                ip_str.c_str(), prot.nh_local_oid);
-            }
-            else
-            {
-                /* Neighbor not yet resolved — create our own NH */
-                sai_ip_address_t sai_ip;
-                sai_ip.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
-                inet_pton(AF_INET, ip_str.c_str(), &sai_ip.addr.ip4);
-
-                std::vector<sai_attribute_t> nh_attrs;
-                sai_attribute_t attr;
-
-                attr.id = SAI_NEXT_HOP_ATTR_TYPE;
-                attr.value.s32 = SAI_NEXT_HOP_TYPE_IP;
-                nh_attrs.push_back(attr);
-
-                attr.id = SAI_NEXT_HOP_ATTR_IP;
-                attr.value.ipaddr = sai_ip;
-                nh_attrs.push_back(attr);
-
-                attr.id = SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID;
-                attr.value.oid = vlan_rif_oid;
-                nh_attrs.push_back(attr);
-
-                sai_status_t status = sai_next_hop_api->create_next_hop(
-                    &prot.nh_local_oid, gSwitchId,
-                    static_cast<uint32_t>(nh_attrs.size()),
-                    nh_attrs.data());
-                if (status != SAI_STATUS_SUCCESS)
-                {
-                    SWSS_LOG_ERROR("HW FRR: failed to create local NH for %s (status=%d)",
-                                   ip_str.c_str(), status);
-                    removeHwFrrProtectionGroups(es_port);
-                    return status;
-                }
-                prot.owns_local_nh = true;
-                SWSS_LOG_NOTICE("HW FRR: created local NH for %s → 0x%" PRIx64 " (no neighbor yet)",
-                                ip_str.c_str(), prot.nh_local_oid);
-            }
+            SWSS_LOG_ERROR("HW FRR: failed to create route %s → PROTECTION NHG (status=%d)",
+                           server_ip.to_string().c_str(), status);
+            removeHwFrrProtectionGroups(es_port);
+            return status;
         }
 
-        /* 3b. Create PROTECTION NHG */
-        {
-            sai_attribute_t nhg_attr;
-            nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
-            nhg_attr.value.s32 = SAI_NEXT_HOP_GROUP_TYPE_PROTECTION;
+        route.owns_route = true;
+        state.server_routes.push_back(route);
 
-            sai_status_t status = sai_next_hop_group_api->create_next_hop_group(
-                &prot.prot_nhg_oid, gSwitchId, 1, &nhg_attr);
-            if (status != SAI_STATUS_SUCCESS)
-            {
-                SWSS_LOG_ERROR("HW FRR: failed to create PROTECTION NHG for %s (status=%d)",
-                               server_ip.to_string().c_str(), status);
-                removeHwFrrProtectionGroups(es_port);
-                return status;
-            }
-        }
-
-        /* 3c. Create PRIMARY member (local NH, monitored by PortChannel) */
-        {
-            std::vector<sai_attribute_t> mbr_attrs;
-            sai_attribute_t attr;
-
-            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
-            attr.value.oid = prot.prot_nhg_oid;
-            mbr_attrs.push_back(attr);
-
-            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
-            attr.value.oid = prot.nh_local_oid;
-            mbr_attrs.push_back(attr);
-
-            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_CONFIGURED_ROLE;
-            attr.value.s32 = SAI_NEXT_HOP_GROUP_MEMBER_CONFIGURED_ROLE_PRIMARY;
-            mbr_attrs.push_back(attr);
-
-            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_MONITORED_OBJECT;
-            attr.value.oid = pc_oid;
-            mbr_attrs.push_back(attr);
-
-            sai_status_t status = sai_next_hop_group_api->create_next_hop_group_member(
-                &prot.primary_member_oid, gSwitchId,
-                static_cast<uint32_t>(mbr_attrs.size()),
-                mbr_attrs.data());
-            if (status != SAI_STATUS_SUCCESS)
-            {
-                SWSS_LOG_ERROR("HW FRR: failed to create PRIMARY member (status=%d)", status);
-                removeHwFrrProtectionGroups(es_port);
-                return status;
-            }
-        }
-
-        /* 3d. Create STANDBY member → HW_PROTECTION NHG with all sisters */
-        {
-            std::vector<sai_attribute_t> mbr_attrs;
-            sai_attribute_t attr;
-
-            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
-            attr.value.oid = prot.prot_nhg_oid;
-            mbr_attrs.push_back(attr);
-
-            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
-            attr.value.oid = state.nhg_subsets[all_mask].nhg_oid;
-            mbr_attrs.push_back(attr);
-
-            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_CONFIGURED_ROLE;
-            attr.value.s32 = SAI_NEXT_HOP_GROUP_MEMBER_CONFIGURED_ROLE_STANDBY;
-            mbr_attrs.push_back(attr);
-
-            sai_status_t status = sai_next_hop_group_api->create_next_hop_group_member(
-                &prot.standby_member_oid, gSwitchId,
-                static_cast<uint32_t>(mbr_attrs.size()),
-                mbr_attrs.data());
-            if (status != SAI_STATUS_SUCCESS)
-            {
-                SWSS_LOG_ERROR("HW FRR: failed to create STANDBY member (status=%d)", status);
-                removeHwFrrProtectionGroups(es_port);
-                return status;
-            }
-        }
-
-        /* 3e. Create /32 route in VRF → PROTECTION NHG.
-         *     The /32 host path currently comes from the SAI neighbor entry
-         *     (ARP adjacency), not a SAI route. We create a new route entry
-         *     pointing to our PROTECTION NHG. VPP's FIB gives API-sourced
-         *     routes higher priority than adjacency-sourced paths, so our
-         *     route will be used for forwarding.
-         *     The primary member of the PROTECTION NHG uses the same NH OID
-         *     as the neighbor entry, so traffic flows identically in the
-         *     normal (non-failover) case. */
-        {
-            sai_route_entry_t route_entry;
-            route_entry.switch_id = gSwitchId;
-            route_entry.vr_id = vrf_oid;
-            route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
-
-            std::string ip_str = server_ip.getIp().to_string();
-            inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
-
-            std::string mask_str = server_ip.getMask().to_string();
-            inet_pton(AF_INET, mask_str.c_str(), &route_entry.destination.mask.ip4);
-
-            prot.owns_route = true;
-
-            sai_attribute_t route_attr;
-            route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
-            route_attr.value.oid = prot.prot_nhg_oid;
-
-            sai_status_t status = sai_route_api->create_route_entry(
-                &route_entry, 1, &route_attr);
-            if (status != SAI_STATUS_SUCCESS)
-            {
-                SWSS_LOG_ERROR("HW FRR: failed to create route %s → PROTECTION NHG (status=%d)",
-                               server_ip.to_string().c_str(), status);
-                removeHwFrrProtectionGroups(es_port);
-                return status;
-            }
-            SWSS_LOG_NOTICE("HW FRR: created route %s → prot_nhg=0x%" PRIx64
-                            " (local_nh=0x%" PRIx64 " %s)",
-                            server_ip.to_string().c_str(), prot.prot_nhg_oid,
-                            prot.nh_local_oid,
-                            prot.owns_local_nh ? "self-created" : "borrowed");
-        }
-
-        SWSS_LOG_NOTICE("HW FRR: PROTECTION group for %s: prot_nhg=0x%" PRIx64
-                        " local_nh=0x%" PRIx64 " standby→NHG[0x%02x]",
-                        server_ip.to_string().c_str(), prot.prot_nhg_oid,
-                        prot.nh_local_oid, all_mask);
-
-        state.prot_groups.push_back(prot);
+        SWSS_LOG_NOTICE("HW FRR: route %s → PROTECTION NHG 0x%" PRIx64,
+                        server_ip.to_string().c_str(), state.prot_nhg_oid);
     }
 
-    SWSS_LOG_NOTICE("HW FRR: ES port %s fully provisioned: %u sisters, %u NHG subsets, "
-                    "%zu PROTECTION groups",
-                    es_port.c_str(), N, all_mask, state.prot_groups.size());
+    SWSS_LOG_NOTICE("HW FRR: ES port %s fully provisioned: %zu peers, "
+                    "1 PROTECTION NHG, 1 standby ECMP NHG, %zu server routes",
+                    es_port.c_str(), state.peers.size(), state.server_routes.size());
     return SAI_STATUS_SUCCESS;
 }
 
 /*
- * HW FRR — Remove all protection groups for an ES port.
- * Tears down in reverse order: routes, PROTECTION NHG members/NHGs,
- * HW_PROTECTION NHG members/NHGs, local NHs.
+ * HW FRR — Remove all protection group objects for an ES port.
+ * Order: routes → PROTECTION NHG members → PROTECTION NHG →
+ *        ECMP NHG members → ECMP NHG → local NH (if owned).
  * Tunnel NHs are shared (via m_l3TunnelNexthops) and NOT removed here.
  */
 sai_status_t EvpnMhOrch::removeHwFrrProtectionGroups(const std::string &es_port)
@@ -1518,72 +1476,67 @@ sai_status_t EvpnMhOrch::removeHwFrrProtectionGroups(const std::string &es_port)
     }
 
     EsHwFrrState &state = state_it->second;
-
-    /* Remove routes and PROTECTION NHGs (per-server) */
     sai_object_id_t vrf_oid = getVrfOidForEsPort(es_port);
 
-    for (auto &prot : state.prot_groups)
+    /* Remove server /32 routes */
+    for (auto &route : state.server_routes)
     {
-        /* Remove route (we always create it, so always delete) */
-        if (vrf_oid != SAI_NULL_OBJECT_ID)
+        if (route.owns_route && vrf_oid != SAI_NULL_OBJECT_ID)
         {
             sai_route_entry_t route_entry;
             route_entry.switch_id = gSwitchId;
             route_entry.vr_id = vrf_oid;
             route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
 
-            std::string ip_str = prot.server_ip.getIp().to_string();
+            std::string ip_str = route.server_ip.getIp().to_string();
             inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
-            std::string mask_str = prot.server_ip.getMask().to_string();
+            std::string mask_str = route.server_ip.getMask().to_string();
             inet_pton(AF_INET, mask_str.c_str(), &route_entry.destination.mask.ip4);
 
             sai_route_api->remove_route_entry(&route_entry);
         }
-
-        /* Remove PROTECTION NHG members, then NHG */
-        if (prot.standby_member_oid != SAI_NULL_OBJECT_ID)
-            sai_next_hop_group_api->remove_next_hop_group_member(prot.standby_member_oid);
-        if (prot.primary_member_oid != SAI_NULL_OBJECT_ID)
-            sai_next_hop_group_api->remove_next_hop_group_member(prot.primary_member_oid);
-        if (prot.prot_nhg_oid != SAI_NULL_OBJECT_ID)
-            sai_next_hop_group_api->remove_next_hop_group(prot.prot_nhg_oid);
-
-        /* Remove local NH only if we created it (not borrowed from neighorch) */
-        if (prot.owns_local_nh && prot.nh_local_oid != SAI_NULL_OBJECT_ID)
-            sai_next_hop_api->remove_next_hop(prot.nh_local_oid);
     }
 
-    /* Remove all HW_PROTECTION NHG subsets */
-    for (auto &kv : state.nhg_subsets)
+    /* Remove PROTECTION NHG members, then NHG */
+    if (state.standby_member_oid != SAI_NULL_OBJECT_ID)
+        sai_next_hop_group_api->remove_next_hop_group_member(state.standby_member_oid);
+    if (state.primary_member_oid != SAI_NULL_OBJECT_ID)
+        sai_next_hop_group_api->remove_next_hop_group_member(state.primary_member_oid);
+    if (state.prot_nhg_oid != SAI_NULL_OBJECT_ID)
+        sai_next_hop_group_api->remove_next_hop_group(state.prot_nhg_oid);
+
+    /* Remove ECMP NHG members, then NHG */
+    for (auto &peer : state.peers)
     {
-        auto &subset = kv.second;
-        for (auto &mbr_oid : subset.member_oids)
-        {
-            sai_next_hop_group_api->remove_next_hop_group_member(mbr_oid);
-        }
-        sai_next_hop_group_api->remove_next_hop_group(subset.nhg_oid);
+        if (peer.ecmp_member_oid != SAI_NULL_OBJECT_ID)
+            sai_next_hop_group_api->remove_next_hop_group_member(peer.ecmp_member_oid);
     }
+    if (state.standby_ecmp_nhg_oid != SAI_NULL_OBJECT_ID)
+        sai_next_hop_group_api->remove_next_hop_group(state.standby_ecmp_nhg_oid);
 
-    SWSS_LOG_NOTICE("HW FRR: removed all protection groups for ES port %s "
-                    "(%zu PROTECTION groups, %zu NHG subsets)",
-                    es_port.c_str(), state.prot_groups.size(), state.nhg_subsets.size());
+    /* Remove local NH only if we created it */
+    if (state.owns_local_nh && state.nh_local_oid != SAI_NULL_OBJECT_ID)
+        sai_next_hop_api->remove_next_hop(state.nh_local_oid);
+
+    SWSS_LOG_NOTICE("HW FRR: removed all objects for ES port %s (%zu routes)",
+                    es_port.c_str(), state.server_routes.size());
 
     m_hwFrrState.erase(state_it);
     return SAI_STATUS_SUCCESS;
 }
 
 /*
- * HW FRR — Update the active sister mask for an ES port.
- * Called when a sister's ES state changes (BGP Type-1 withdrawal/advertisement).
- * Swaps each PROTECTION group's STANDBY member to point to the NHG subset
- * matching the new active mask.
+ * HW FRR — Update the standby ECMP NHG members when the set of active
+ * peer VTEPs changes (triggered by EVPN Type-4 ES route updates).
  *
- * This is O(M) where M = number of server IPs per ES port (typically 1-2).
- * Each update is a single SAI attribute set — no member add/remove.
+ * This is O(N) where N = number of peer VTEPs (typically 1-7).
+ * It adds/removes ECMP NHG members to match the new active set.
+ * All server routes continue pointing to the same PROTECTION NHG — no
+ * per-server updates needed.
  */
-sai_status_t EvpnMhOrch::updateHwFrrActiveSisters(
+sai_status_t EvpnMhOrch::updateHwFrrStandbyEcmp(
     const std::string &es_port,
-    uint8_t new_active_mask)
+    const std::set<std::string> &active_vteps)
 {
     SWSS_LOG_ENTER();
 
@@ -1595,103 +1548,86 @@ sai_status_t EvpnMhOrch::updateHwFrrActiveSisters(
     }
 
     EsHwFrrState &state = state_it->second;
-    uint8_t old_mask = state.active_sister_mask;
 
-    if (new_active_mask == old_mask)
+    SWSS_LOG_NOTICE("HW FRR: updating standby ECMP for %s: %zu active VTEPs",
+                    es_port.c_str(), active_vteps.size());
+
+    if (active_vteps.empty())
     {
-        SWSS_LOG_NOTICE("HW FRR: active mask unchanged (0x%02x) for %s",
-                        old_mask, es_port.c_str());
-        return SAI_STATUS_SUCCESS;
-    }
-
-    SWSS_LOG_NOTICE("HW FRR: updating active sisters for %s: 0x%02x → 0x%02x",
-                    es_port.c_str(), old_mask, new_active_mask);
-
-    if (new_active_mask == 0)
-    {
-        SWSS_LOG_WARN("HW FRR: ALL sisters down for ES port %s — no backup path!",
+        SWSS_LOG_WARN("HW FRR: ALL peers down for ES port %s — no backup path!",
                       es_port.c_str());
-        /* We can't point STANDBY to an empty NHG. Keep pointing to old mask —
-         * traffic will black-hole on local failure, but that's the expected
-         * behavior when all sisters are down. */
-        state.active_sister_mask = 0;
+        /* Remove all ECMP members but keep the NHG (so PROTECTION NHG stays valid) */
+        for (auto &peer : state.peers)
+        {
+            if (peer.ecmp_member_oid != SAI_NULL_OBJECT_ID)
+            {
+                sai_next_hop_group_api->remove_next_hop_group_member(peer.ecmp_member_oid);
+                peer.ecmp_member_oid = SAI_NULL_OBJECT_ID;
+            }
+        }
         return SAI_STATUS_SUCCESS;
     }
 
-    /* Validate the new mask has a pre-provisioned NHG */
-    auto nhg_it = state.nhg_subsets.find(new_active_mask);
-    if (nhg_it == state.nhg_subsets.end())
+    /* For each peer: add member if newly active, remove if no longer active */
+    for (auto &peer : state.peers)
     {
-        SWSS_LOG_ERROR("HW FRR: no pre-provisioned NHG for mask 0x%02x on %s",
-                       new_active_mask, es_port.c_str());
-        return SAI_STATUS_FAILURE;
-    }
+        bool should_be_active = (active_vteps.count(peer.vtep_ip) > 0);
+        bool is_active = (peer.ecmp_member_oid != SAI_NULL_OBJECT_ID);
 
-    sai_object_id_t new_nhg_oid = nhg_it->second.nhg_oid;
-
-    /* Swap STANDBY member on each PROTECTION group */
-    for (auto &prot : state.prot_groups)
-    {
-        sai_attribute_t attr;
-        attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
-        attr.value.oid = new_nhg_oid;
-
-        sai_status_t status = sai_next_hop_group_api->set_next_hop_group_member_attribute(
-            prot.standby_member_oid, &attr);
-        if (status != SAI_STATUS_SUCCESS)
+        if (should_be_active && !is_active)
         {
-            SWSS_LOG_ERROR("HW FRR: failed to swap STANDBY for %s to NHG[0x%02x] (status=%d)",
-                           prot.server_ip.to_string().c_str(), new_active_mask, status);
-            return status;
-        }
+            /* Add member */
+            std::vector<sai_attribute_t> mbr_attrs;
+            sai_attribute_t attr;
 
-        SWSS_LOG_NOTICE("HW FRR: swapped STANDBY for %s → NHG[0x%02x] (0x%" PRIx64 ")",
-                        prot.server_ip.to_string().c_str(), new_active_mask, new_nhg_oid);
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
+            attr.value.oid = state.standby_ecmp_nhg_oid;
+            mbr_attrs.push_back(attr);
+
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+            attr.value.oid = peer.nh_tunnel_oid;
+            mbr_attrs.push_back(attr);
+
+            sai_status_t status = sai_next_hop_group_api->create_next_hop_group_member(
+                &peer.ecmp_member_oid, gSwitchId,
+                static_cast<uint32_t>(mbr_attrs.size()),
+                mbr_attrs.data());
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("HW FRR: failed to add peer %s to ECMP NHG (status=%d)",
+                               peer.vtep_ip.c_str(), status);
+                return status;
+            }
+
+            SWSS_LOG_NOTICE("HW FRR: added peer %s to standby ECMP (member=0x%" PRIx64 ")",
+                            peer.vtep_ip.c_str(), peer.ecmp_member_oid);
+        }
+        else if (!should_be_active && is_active)
+        {
+            /* Remove member */
+            sai_status_t status = sai_next_hop_group_api->remove_next_hop_group_member(
+                peer.ecmp_member_oid);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("HW FRR: failed to remove peer %s from ECMP NHG (status=%d)",
+                               peer.vtep_ip.c_str(), status);
+                return status;
+            }
+
+            SWSS_LOG_NOTICE("HW FRR: removed peer %s from standby ECMP",
+                            peer.vtep_ip.c_str());
+            peer.ecmp_member_oid = SAI_NULL_OBJECT_ID;
+        }
     }
 
-    state.active_sister_mask = new_active_mask;
     return SAI_STATUS_SUCCESS;
-}
-
-/*
- * Refresh the active sister mask for an ES port by querying FRR directly.
- * This is the pull-based alternative to the EVPN_MH_ES_STATE_TABLE push path.
- * Can be called periodically or on specific events (e.g., FDB changes).
- */
-sai_status_t EvpnMhOrch::refreshHwFrrSisterState(const std::string &es_port)
-{
-    SWSS_LOG_ENTER();
-
-    auto state_it = m_hwFrrState.find(es_port);
-    if (state_it == m_hwFrrState.end())
-    {
-        return SAI_STATUS_SUCCESS;  /* Not an HW FRR port */
-    }
-
-    EsHwFrrState &state = state_it->second;
-
-    /* Query FRR for active remote VTEPs */
-    std::set<std::string> active_vteps = getActiveRemoteVteps(es_port);
-
-    /* Convert to bitmask */
-    uint8_t new_mask = 0;
-    for (const auto &sister : state.sisters)
-    {
-        if (active_vteps.count(sister.vtep_ip.to_string()))
-        {
-            new_mask |= (1 << sister.index);
-        }
-    }
-
-    return updateHwFrrActiveSisters(es_port, new_mask);
 }
 
 /*
  * HW FRR — Handle local port down event.
  * VPP doesn't natively implement MONITORED_OBJECT for PROTECTION NHGs,
  * so we do it in software: swap each server IP route from the PROTECTION NHG
- * (which has the now-unreachable local primary path) to the standby
- * HW_PROTECTION NHG (tunnel-only paths to sister T1s).
+ * to the standby ECMP NHG directly.
  *
  * Called by fdborch when an ES port (PortChannel) goes operationally down.
  */
@@ -1707,6 +1643,7 @@ sai_status_t EvpnMhOrch::handleHwFrrLocalPortDown(const std::string &es_port)
     }
 
     EsHwFrrState &state = state_it->second;
+
     sai_object_id_t vrf_oid = getVrfOidForEsPort(es_port);
     if (vrf_oid == SAI_NULL_OBJECT_ID)
     {
@@ -1714,56 +1651,34 @@ sai_status_t EvpnMhOrch::handleHwFrrLocalPortDown(const std::string &es_port)
         return SAI_STATUS_FAILURE;
     }
 
-    /* Find the standby NHG to route through */
-    uint8_t standby_mask = state.active_sister_mask;
-    if (standby_mask == 0)
+    for (auto &route : state.server_routes)
     {
-        /* Use the full mask (all sisters) as fallback — traffic will
-         * black-hole at the tunnel endpoint if sisters are also down,
-         * but at least the local path is definitively unreachable. */
-        for (const auto &sister : state.sisters)
-            standby_mask |= (1 << sister.index);
-    }
-
-    auto nhg_it = state.nhg_subsets.find(standby_mask);
-    if (nhg_it == state.nhg_subsets.end())
-    {
-        SWSS_LOG_ERROR("HW FRR port down: no NHG for mask 0x%02x on %s",
-                       standby_mask, es_port.c_str());
-        return SAI_STATUS_FAILURE;
-    }
-
-    sai_object_id_t standby_nhg_oid = nhg_it->second.nhg_oid;
-
-    for (auto &prot : state.prot_groups)
-    {
-        /* Swap the /32 route to point directly to the standby NHG (tunnel only) */
         sai_route_entry_t route_entry;
         route_entry.switch_id = gSwitchId;
         route_entry.vr_id = vrf_oid;
         route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
 
-        std::string ip_str = prot.server_ip.getIp().to_string();
-        std::string mask_str = prot.server_ip.getMask().to_string();
+        std::string ip_str = route.server_ip.getIp().to_string();
+        std::string mask_str = route.server_ip.getMask().to_string();
         inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
         inet_pton(AF_INET, mask_str.c_str(), &route_entry.destination.mask.ip4);
 
         sai_attribute_t route_attr;
         route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
-        route_attr.value.oid = standby_nhg_oid;
+        route_attr.value.oid = state.standby_ecmp_nhg_oid;
 
         sai_status_t status = sai_route_api->set_route_entry_attribute(
             &route_entry, &route_attr);
         if (status != SAI_STATUS_SUCCESS)
         {
-            SWSS_LOG_ERROR("HW FRR port down: failed to swap route %s to standby NHG "
-                           "(status=%d)", prot.server_ip.to_string().c_str(), status);
+            SWSS_LOG_ERROR("HW FRR port down: failed to swap route %s (status=%d)",
+                           route.server_ip.to_string().c_str(), status);
             continue;
         }
 
-        SWSS_LOG_NOTICE("HW FRR port down: %s route %s → standby NHG[0x%02x] (0x%" PRIx64 ")",
-                        es_port.c_str(), prot.server_ip.to_string().c_str(),
-                        standby_mask, standby_nhg_oid);
+        SWSS_LOG_NOTICE("HW FRR port down: %s route %s → standby ECMP NHG (0x%" PRIx64 ")",
+                        es_port.c_str(), route.server_ip.to_string().c_str(),
+                        state.standby_ecmp_nhg_oid);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1771,7 +1686,7 @@ sai_status_t EvpnMhOrch::handleHwFrrLocalPortDown(const std::string &es_port)
 
 /*
  * HW FRR — Handle local port up event.
- * Restore each server IP route to the full PROTECTION NHG (which includes
+ * Restore each server IP route to the PROTECTION NHG (which includes
  * the local primary path via BVI).
  *
  * Called by fdborch when an ES port (PortChannel) comes back up.
@@ -1795,35 +1710,34 @@ sai_status_t EvpnMhOrch::handleHwFrrLocalPortUp(const std::string &es_port)
         return SAI_STATUS_FAILURE;
     }
 
-    for (auto &prot : state.prot_groups)
+    for (auto &route : state.server_routes)
     {
-        /* Restore the /32 route to the full PROTECTION NHG */
         sai_route_entry_t route_entry;
         route_entry.switch_id = gSwitchId;
         route_entry.vr_id = vrf_oid;
         route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
 
-        std::string ip_str = prot.server_ip.getIp().to_string();
-        std::string mask_str = prot.server_ip.getMask().to_string();
+        std::string ip_str = route.server_ip.getIp().to_string();
+        std::string mask_str = route.server_ip.getMask().to_string();
         inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
         inet_pton(AF_INET, mask_str.c_str(), &route_entry.destination.mask.ip4);
 
         sai_attribute_t route_attr;
         route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
-        route_attr.value.oid = prot.prot_nhg_oid;
+        route_attr.value.oid = state.prot_nhg_oid;
 
         sai_status_t status = sai_route_api->set_route_entry_attribute(
             &route_entry, &route_attr);
         if (status != SAI_STATUS_SUCCESS)
         {
-            SWSS_LOG_ERROR("HW FRR port up: failed to restore route %s to PROTECTION NHG "
-                           "(status=%d)", prot.server_ip.to_string().c_str(), status);
+            SWSS_LOG_ERROR("HW FRR port up: failed to restore route %s (status=%d)",
+                           route.server_ip.to_string().c_str(), status);
             continue;
         }
 
         SWSS_LOG_NOTICE("HW FRR port up: %s route %s → PROTECTION NHG (0x%" PRIx64 ")",
-                        es_port.c_str(), prot.server_ip.to_string().c_str(),
-                        prot.prot_nhg_oid);
+                        es_port.c_str(), route.server_ip.to_string().c_str(),
+                        state.prot_nhg_oid);
     }
 
     return SAI_STATUS_SUCCESS;
