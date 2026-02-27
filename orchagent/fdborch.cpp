@@ -1653,12 +1653,20 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
             auto mode = gEvpnMhOrch->getEffectiveFailoverMode(p.m_alias);
             if (mode == EvpnMhFailoverMode::HW)
             {
-                /* HW FRR: ASIC handles failover via PROTECTION NHG MONITORED_OBJECT.
-                 * No software intervention needed — the ASIC auto-switches to STANDBY
-                 * path when the monitored PortChannel goes down.
-                 * FRR handles BGP Type-1 AD-per-ES withdrawal independently. */
-                SWSS_LOG_NOTICE("EVPN MH HW failover: port %s down — ASIC handles via PROTECTION NHG, "
-                    "no SW intervention", p.m_alias.c_str());
+                /* HW FRR: VPP doesn't natively implement MONITORED_OBJECT for
+                 * PROTECTION NHGs, so we trigger the failover from software:
+                 * swap each server IP route from PROTECTION NHG to standby
+                 * ECMP NHG (tunnel-only paths to peer T1s). */
+                SWSS_LOG_NOTICE("EVPN MH HW failover: port %s down — swapping L3 routes to standby NHG",
+                    p.m_alias.c_str());
+                gEvpnMhOrch->handleHwFrrLocalPortDown(p.m_alias);
+
+                /* Also reroute L2 FDB entries from the downed port to the
+                 * VxLAN tunnel so cross-server (intra-subnet) traffic is
+                 * carried via the peer T1 during failover. */
+                SWSS_LOG_NOTICE("EVPN MH HW failover: port %s down — rerouting L2 FDB to tunnel",
+                    p.m_alias.c_str());
+                evpnMhRerouteToTunnel(p);
                 return;
             }
             else if (mode == EvpnMhFailoverMode::L3)
@@ -1708,10 +1716,20 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
             auto mode = gEvpnMhOrch->getEffectiveFailoverMode(p.m_alias);
             if (mode == EvpnMhFailoverMode::HW)
             {
-                /* HW FRR: ASIC auto-restores to PRIMARY when MONITORED_OBJECT comes back up.
-                 * No software intervention needed. */
-                SWSS_LOG_NOTICE("EVPN MH HW restore: port %s up — ASIC auto-restores via PROTECTION NHG",
+                /* HW FRR: Restore L3 routes from standby NHG back to the full
+                 * PROTECTION NHG (primary local path + standby tunnel). */
+                SWSS_LOG_NOTICE("EVPN MH HW restore: port %s up — restoring L3 routes to PROTECTION NHG",
                     p.m_alias.c_str());
+                gEvpnMhOrch->handleHwFrrLocalPortUp(p.m_alias);
+
+                /* Also restore L2 FDB entries back to the local port */
+                if (m_reroutedEntries.find(p.m_alias) != m_reroutedEntries.end() &&
+                    !m_reroutedEntries[p.m_alias].empty())
+                {
+                    SWSS_LOG_NOTICE("EVPN MH HW restore: port %s up — restoring L2 FDB from tunnel",
+                        p.m_alias.c_str());
+                    evpnMhRestoreFromTunnel(p);
+                }
                 return;
             }
 
