@@ -97,6 +97,8 @@ public:
 
     bool m_isEvpnNvoExist = false;
 
+    void scanExistingNhgs();
+
 private:
     ProducerStateTable m_fdbTable;
     ProducerStateTable m_imetTable;
@@ -199,6 +201,7 @@ private:
     void onMsgNbr(int nlmsg_type, struct nl_object *obj);
     void onMsgNbrRaw(struct nlmsghdr *msg);
     void onMsgLink(int nlmsg_type, struct nl_object *obj);
+    void onMsgLinkRaw(struct nlmsghdr *msg);
     void onMsgNhg(struct nlmsghdr *msg);
 
     enum L2NhgType {
@@ -213,6 +216,15 @@ private:
         std::vector<uint32_t> member_ids;   /* For GROUP type */
     };
     std::unordered_map<uint32_t, l2_nhg_info> m_l2NhgMap;
+
+    /* NHG group ID → ES port name mapping (populated from FRR) */
+    std::unordered_map<uint32_t, std::string> m_nhgToEsPort;
+
+    /* Query FRR via vtysh to build NHG→ES port mapping */
+    void refreshEsNhgMapping();
+
+    /* Resolve VTEP IPs from a group NHG's members and update ES state */
+    void resolveNhgGroupVteps(uint32_t nhg_id);
 };
 
 }

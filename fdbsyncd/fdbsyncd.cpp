@@ -25,7 +25,7 @@ int main(int argc, char **argv)
 
     NetDispatcher::getInstance().registerMessageHandler(RTM_NEWNEIGH, &sync);
     NetDispatcher::getInstance().registerMessageHandler(RTM_DELNEIGH, &sync);
-    NetDispatcher::getInstance().registerMessageHandler(RTM_NEWLINK, &sync);
+    NetDispatcher::getInstance().registerRawMessageHandler(RTM_NEWLINK, &sync);
     NetDispatcher::getInstance().registerRawMessageHandler(RTM_NEWNEXTHOP, &sync);
     NetDispatcher::getInstance().registerRawMessageHandler(RTM_DELNEXTHOP, &sync);
 
@@ -88,6 +88,10 @@ int main(int argc, char **argv)
             netlink.dumpRequest(RTM_GETNEIGH);
 
             netlink.dumpRequest(RTM_GETNEXTHOP);
+
+            /* libnl can't parse RTM_NEWNEXTHOP dump responses (NLE_MSGTYPE_NOSUPPORT),
+             * so scan existing FDB NHGs via ip command instead */
+            sync.scanExistingNhgs();
 
             s.addSelectable(sync.getFdbStateTable());
             s.addSelectable(sync.getMclagRemoteFdbStateTable());

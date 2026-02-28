@@ -8,6 +8,7 @@
 #include <netlink/route/link.h>
 #include <netlink/route/neighbour.h>
 #include <netlink/route/link/vxlan.h>
+#include <netlink/msg.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 
@@ -1047,6 +1048,9 @@ void FdbSync::onMsg(int nlmsg_type, struct nl_object *obj)
 
 void FdbSync::onMsgNhg(struct nlmsghdr *msg)
 {
+    SWSS_LOG_NOTICE("onMsgNhg: received nlmsg_type=%d len=%u",
+                    msg->nlmsg_type, msg->nlmsg_len);
+
     struct nhmsg *nhm = (struct nhmsg *)NLMSG_DATA(msg);
     int len = (int)(msg->nlmsg_len - NLMSG_LENGTH(sizeof(*nhm)));
 
@@ -1153,7 +1157,7 @@ void FdbSync::onMsgNhg(struct nlmsghdr *msg)
             info.vtep_ip = ip_string;
             m_l2NhgMap[nhid] = info;
 
-            SWSS_LOG_INFO("L2_NEXTHOP_GROUP_TABLE: ADD nhid=%u remote_vtep=%s", nhid, ip_string.c_str());
+            SWSS_LOG_NOTICE("L2_NEXTHOP_GROUP_TABLE: ADD nhid=%u remote_vtep=%s", nhid, ip_string.c_str());
         }
         else if (has_group && grp != NULL && grp_count > 0)
         {
@@ -1189,16 +1193,31 @@ void FdbSync::onMsgNhg(struct nlmsghdr *msg)
             info.member_ids = member_ids;
             m_l2NhgMap[nhid] = info;
 
-            SWSS_LOG_INFO("L2_NEXTHOP_GROUP_TABLE: ADD nhid=%u nexthop_group=%s", nhid, nhg_str.c_str());
+            SWSS_LOG_NOTICE("L2_NEXTHOP_GROUP_TABLE: ADD nhid=%u nexthop_group=%s", nhid, nhg_str.c_str());
+
+            /* Resolve VTEP IPs and update ES state for this group */
+            resolveNhgGroupVteps(nhid);
         }
     }
     else if (msg->nlmsg_type == RTM_DELNEXTHOP)
     {
+        /* If this is a group NHG being deleted, clear its ES state first */
+        auto del_it = m_l2NhgMap.find(nhid);
+        if (del_it != m_l2NhgMap.end() && del_it->second.type == L2_NHG_TYPE_GROUP)
+        {
+            auto es_it = m_nhgToEsPort.find(nhid);
+            if (es_it != m_nhgToEsPort.end())
+            {
+                std::set<std::string> empty;
+                updateEsRemoteVteps(es_it->second, empty);
+            }
+        }
+
         /* Delete from L2_NEXTHOP_GROUP_TABLE */
         m_l2NhgTable.del(to_string(nhid));
         m_l2NhgMap.erase(nhid);
 
-        SWSS_LOG_INFO("L2_NEXTHOP_GROUP_TABLE: DEL nhid=%u", nhid);
+        SWSS_LOG_NOTICE("L2_NEXTHOP_GROUP_TABLE: DEL nhid=%u", nhid);
 
         /* Update any GROUP entries that reference this deleted NHG ID */
         std::vector<uint32_t> groups_to_delete;
@@ -1236,16 +1255,27 @@ void FdbSync::onMsgNhg(struct nlmsghdr *msg)
                 fvVector.push_back(fv);
                 m_l2NhgTable.set(to_string(entry.first), fvVector);
 
-                SWSS_LOG_INFO("L2_NEXTHOP_GROUP_TABLE: UPDATE nhid=%u nexthop_group=%s", entry.first, nhg_str.c_str());
+                SWSS_LOG_NOTICE("L2_NEXTHOP_GROUP_TABLE: UPDATE nhid=%u nexthop_group=%s", entry.first, nhg_str.c_str());
+
+                /* Re-resolve VTEP IPs after member removal */
+                resolveNhgGroupVteps(entry.first);
             }
         }
 
         /* Delete empty groups */
         for (auto gid : groups_to_delete)
         {
+            /* Resolve before erasing — sends empty VTEP set (DEL) to ES state table */
+            auto es_it = m_nhgToEsPort.find(gid);
+            if (es_it != m_nhgToEsPort.end())
+            {
+                std::set<std::string> empty;
+                updateEsRemoteVteps(es_it->second, empty);
+            }
+
             m_l2NhgTable.del(to_string(gid));
             m_l2NhgMap.erase(gid);
-            SWSS_LOG_INFO("L2_NEXTHOP_GROUP_TABLE: DEL empty group nhid=%u", gid);
+            SWSS_LOG_NOTICE("L2_NEXTHOP_GROUP_TABLE: DEL empty group nhid=%u", gid);
         }
     }
 }
@@ -1389,8 +1419,25 @@ void FdbSync::onMsgRaw(struct nlmsghdr *msg)
 
     if (msg->nlmsg_type == RTM_NEWLINK)
     {
-        struct nl_object *obj = (struct nl_object *)NLMSG_DATA(msg);
-        onMsg(msg->nlmsg_type, obj);
+        /* Parse raw for bridge port BACKUP_NHID attribute */
+        onMsgLinkRaw(msg);
+
+        /* Also parse via libnl for existing VxLAN interface tracking.
+         * Re-parse the raw message into a libnl nl_msg and dispatch. */
+        struct nl_msg *nlmsg = nlmsg_convert(msg);
+        if (nlmsg)
+        {
+            /* Use nl_msg_parse to get a proper link object */
+            if (nl_msg_parse(nlmsg, [](struct nl_object *obj, void *arg) {
+                FdbSync *sync = (FdbSync *)arg;
+                sync->onMsg(RTM_NEWLINK, obj);
+            }, this) < 0)
+            {
+                /* Parse failed — AF_BRIDGE messages may not parse as rtnl_link,
+                 * that's OK — we still got the raw bridge port info above */
+            }
+            nlmsg_free(nlmsg);
+        }
     }
     else if (msg->nlmsg_type == RTM_NEWNEIGH || msg->nlmsg_type == RTM_DELNEIGH)
     {
@@ -1546,4 +1593,259 @@ void FdbSync::updateEsRemoteVteps(const std::string &es_port,
     SWSS_LOG_NOTICE("EVPN_MH_ES_STATE_TABLE: SET %s active_vteps=%s",
                     es_port.c_str(), vtep_list.c_str());
     m_evpnMhEsStateTable->set(es_port, fvs);
+}
+
+/*
+ * Query FRR via vtysh to build NHG group ID → ES port mapping.
+ * Parses 'show evpn es json' output to extract nhgId and interface per ES.
+ *
+ * Example FRR JSON:
+ * {
+ *   "03:00:00:00:00:01:01:00:00:01": {
+ *     "type": "Local,Remote",
+ *     "interface": "PortChannel0",
+ *     "nhgId": 536870913,
+ *     "vteps": [{"vtep": "10.1.0.2", ...}]
+ *   }
+ * }
+ */
+/*
+ * Parse RTM_NEWLINK for bridge port attributes.
+ * Extracts IFLA_BRPORT_BACKUP_NHID from IFLA_PROTINFO to build
+ * the NHG group ID → ES port name mapping.
+ *
+ * FRR's zebra sends this when an ES is created/updated on a bond.
+ */
+#ifndef IFLA_BRPORT_BACKUP_NHID
+#define IFLA_BRPORT_BACKUP_NHID 44
+#endif
+
+void FdbSync::onMsgLinkRaw(struct nlmsghdr *msg)
+{
+    struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(msg);
+    int len = (int)(msg->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi)));
+
+    if (len < 0)
+        return;
+
+    /* Only interested in AF_BRIDGE family (bridge port updates) */
+    if (ifi->ifi_family != AF_BRIDGE)
+        return;
+
+    /* Parse top-level attributes looking for IFLA_PROTINFO */
+    struct rtattr *rta = IFLA_RTA(ifi);
+    uint32_t backup_nhg_id = 0;
+    bool found_nhid = false;
+
+    for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len))
+    {
+        if (rta->rta_type == (IFLA_PROTINFO | NLA_F_NESTED) ||
+            rta->rta_type == IFLA_PROTINFO)
+        {
+            /* Parse nested bridge port attributes */
+            struct rtattr *br_rta = (struct rtattr *)RTA_DATA(rta);
+            int br_len = (int)RTA_PAYLOAD(rta);
+
+            for (; RTA_OK(br_rta, br_len); br_rta = RTA_NEXT(br_rta, br_len))
+            {
+                if (br_rta->rta_type == IFLA_BRPORT_BACKUP_NHID)
+                {
+                    backup_nhg_id = *(uint32_t *)RTA_DATA(br_rta);
+                    found_nhid = true;
+                }
+            }
+        }
+    }
+
+    if (!found_nhid || backup_nhg_id == 0)
+        return;
+
+    /* Resolve ifindex → interface name */
+    char ifname[IF_NAMESIZE];
+    if (if_indextoname(ifi->ifi_index, ifname) == nullptr)
+    {
+        SWSS_LOG_WARN("onMsgLinkRaw: cannot resolve ifindex %d", ifi->ifi_index);
+        return;
+    }
+
+    std::string port_name(ifname);
+
+    /* Update NHG→ES port mapping */
+    auto it = m_nhgToEsPort.find(backup_nhg_id);
+    if (it != m_nhgToEsPort.end() && it->second == port_name)
+    {
+        return; /* No change */
+    }
+
+    m_nhgToEsPort[backup_nhg_id] = port_name;
+    SWSS_LOG_NOTICE("onMsgLinkRaw: NHG %u → ES port %s (ifindex %d)",
+                    backup_nhg_id, port_name.c_str(), ifi->ifi_index);
+
+    /* If we already have this NHG group in m_l2NhgMap, resolve VTEPs now */
+    resolveNhgGroupVteps(backup_nhg_id);
+}
+
+void FdbSync::refreshEsNhgMapping()
+{
+    /* NHG→ES port mapping is now driven by kernel RTM_NEWLINK events
+     * carrying IFLA_BRPORT_BACKUP_NHID (sent by FRR zebra).
+     * This function is a no-op fallback — the mapping is populated
+     * by onMsgLinkRaw() as bridge port updates arrive. */
+    SWSS_LOG_INFO("refreshEsNhgMapping: mapping driven by kernel IFLA_BRPORT_BACKUP_NHID events");
+}
+
+/*
+ * Scan existing kernel FDB nexthops at startup.
+ * libnl's RTM_GETNEXTHOP dump fails with NLE_MSGTYPE_NOSUPPORT (-25),
+ * so we parse `ip nexthop show fdb` output instead.
+ *
+ * Format examples:
+ *   id 268435459 via 10.1.0.2 scope link fdb
+ *   id 536870913 group 268435459 fdb
+ *   id 536870914 group 268435459/268435460 fdb
+ */
+void FdbSync::scanExistingNhgs()
+{
+    SWSS_LOG_NOTICE("scanExistingNhgs: scanning kernel FDB nexthops");
+
+    FILE *fp = popen("ip nexthop show fdb 2>/dev/null", "r");
+    if (!fp)
+    {
+        SWSS_LOG_WARN("scanExistingNhgs: failed to run ip nexthop show fdb");
+        return;
+    }
+
+    char buf[1024];
+    int vtep_count = 0, group_count = 0;
+
+    while (fgets(buf, sizeof(buf), fp) != nullptr)
+    {
+        std::string line(buf);
+
+        /* Parse "id <N>" */
+        size_t id_pos = line.find("id ");
+        if (id_pos == std::string::npos)
+            continue;
+
+        uint32_t nhid = (uint32_t)strtoul(line.c_str() + id_pos + 3, nullptr, 10);
+        if (nhid == 0)
+            continue;
+
+        /* Check for "via <IP>" (individual VTEP NH) */
+        size_t via_pos = line.find("via ");
+        if (via_pos != std::string::npos)
+        {
+            size_t ip_start = via_pos + 4;
+            size_t ip_end = line.find_first_of(" \t\n", ip_start);
+            std::string ip_str = line.substr(ip_start, ip_end - ip_start);
+
+            /* Store as VTEP type */
+            l2_nhg_info info;
+            info.type = L2_NHG_TYPE_VTEP;
+            info.vtep_ip = ip_str;
+            m_l2NhgMap[nhid] = info;
+
+            SWSS_LOG_NOTICE("scanExistingNhgs: VTEP nhid=%u ip=%s",
+                            nhid, ip_str.c_str());
+            vtep_count++;
+            continue;
+        }
+
+        /* Check for "group <id>[/<id>...]" (group NH) */
+        size_t grp_pos = line.find("group ");
+        if (grp_pos != std::string::npos)
+        {
+            size_t grp_start = grp_pos + 6;
+            size_t grp_end = line.find_first_of(" \t\n", grp_start);
+            std::string grp_str = line.substr(grp_start, grp_end - grp_start);
+
+            /* Parse member IDs (slash-separated) */
+            l2_nhg_info info;
+            info.type = L2_NHG_TYPE_GROUP;
+
+            size_t pos = 0;
+            std::string nhg_members_str;
+            while (pos < grp_str.size())
+            {
+                size_t slash = grp_str.find('/', pos);
+                std::string member_str;
+                if (slash == std::string::npos)
+                {
+                    member_str = grp_str.substr(pos);
+                    pos = grp_str.size();
+                }
+                else
+                {
+                    member_str = grp_str.substr(pos, slash - pos);
+                    pos = slash + 1;
+                }
+
+                uint32_t member_id = (uint32_t)strtoul(member_str.c_str(), nullptr, 10);
+                if (member_id > 0)
+                {
+                    info.member_ids.push_back(member_id);
+                    if (!nhg_members_str.empty())
+                        nhg_members_str += ",";
+                    nhg_members_str += to_string(member_id);
+                }
+            }
+
+            m_l2NhgMap[nhid] = info;
+
+            SWSS_LOG_NOTICE("scanExistingNhgs: GROUP nhid=%u members=[%s]",
+                            nhid, nhg_members_str.c_str());
+            group_count++;
+        }
+    }
+    pclose(fp);
+
+    SWSS_LOG_NOTICE("scanExistingNhgs: found %d VTEPs, %d groups",
+                    vtep_count, group_count);
+}
+
+/*
+ * Resolve the VTEP IPs from a group NHG's member list and call
+ * updateEsRemoteVteps() for the corresponding ES port.
+ */
+void FdbSync::resolveNhgGroupVteps(uint32_t nhg_id)
+{
+    auto grp_it = m_l2NhgMap.find(nhg_id);
+    if (grp_it == m_l2NhgMap.end() || grp_it->second.type != L2_NHG_TYPE_GROUP)
+    {
+        return;
+    }
+
+    /* Look up ES port for this NHG group */
+    auto es_it = m_nhgToEsPort.find(nhg_id);
+    if (es_it == m_nhgToEsPort.end())
+    {
+        /* Try refreshing the mapping from FRR */
+        refreshEsNhgMapping();
+        es_it = m_nhgToEsPort.find(nhg_id);
+        if (es_it == m_nhgToEsPort.end())
+        {
+            SWSS_LOG_NOTICE("resolveNhgGroupVteps: NHG %u not mapped to any ES port", nhg_id);
+            return;
+        }
+    }
+
+    const std::string &es_port = es_it->second;
+
+    /* Resolve member NHG IDs to VTEP IPs */
+    std::set<std::string> vtep_set;
+    for (uint32_t member_id : grp_it->second.member_ids)
+    {
+        auto member_it = m_l2NhgMap.find(member_id);
+        if (member_it != m_l2NhgMap.end() &&
+            member_it->second.type == L2_NHG_TYPE_VTEP &&
+            !member_it->second.vtep_ip.empty())
+        {
+            vtep_set.insert(member_it->second.vtep_ip);
+        }
+    }
+
+    SWSS_LOG_NOTICE("resolveNhgGroupVteps: NHG %u (ES %s) → %zu active VTEPs",
+                    nhg_id, es_port.c_str(), vtep_set.size());
+
+    updateEsRemoteVteps(es_port, vtep_set);
 }
