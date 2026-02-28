@@ -11,10 +11,13 @@
 #include <netlink/msg.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <linux/if_link.h>
+#include <linux/rtnetlink.h>
 
 #include "logger.h"
 #include "dbconnector.h"
 #include "producerstatetable.h"
+#include "table.h"
 #include "ipaddress.h"
 #include "netmsg.h"
 #include "macaddress.h"
@@ -34,7 +37,8 @@ FdbSync::FdbSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector
     m_l2NhgTable(pipelineAppDB, APP_L2_NEXTHOP_GROUP_TABLE_NAME),
     m_fdbStateTable(stateDb, STATE_FDB_TABLE_NAME),
     m_mclagRemoteFdbStateTable(stateDb, STATE_MCLAG_REMOTE_FDB_TABLE_NAME),
-    m_cfgEvpnNvoTable(config_db, CFG_VXLAN_EVPN_NVO_TABLE_NAME)
+    m_cfgEvpnNvoTable(config_db, CFG_VXLAN_EVPN_NVO_TABLE_NAME),
+    m_cfgDb(config_db)
 {
     m_AppRestartAssist = new AppRestartAssist(pipelineAppDB, "fdbsyncd", "swss", DEFAULT_FDBSYNC_WARMSTART_TIMER);
     if (m_AppRestartAssist)
@@ -82,6 +86,32 @@ bool FdbSync::isIntfRestoreDone()
     }
     
     return true;
+}
+
+void FdbSync::checkExistingEvpnNvo()
+{
+    /*
+     * Direct CONFIG_DB lookup for pre-existing NVO config.
+     *
+     * SubscriberStateTable only notifies on changes after subscription.
+     * If NVO was configured before fdbsyncd starts, the flag stays false.
+     *
+     * Race-free ordering: the caller must subscribe (addSelectable on
+     * m_cfgEvpnNvoTable) BEFORE calling this method. That way:
+     *  - Entries created before subscription → caught by this lookup
+     *  - Entries created after subscription  → caught by processCfgEvpnNvo
+     *  - Entries created between sub & lookup → caught by BOTH (idempotent)
+     */
+    Table nvoTable(m_cfgDb, CFG_VXLAN_EVPN_NVO_TABLE_NAME);
+    std::vector<std::string> keys;
+    nvoTable.getKeys(keys);
+    if (!keys.empty())
+    {
+        SWSS_LOG_NOTICE("checkExistingEvpnNvo: found %zu existing NVO entries, enabling EVPN NVO",
+                        keys.size());
+        m_isEvpnNvoExist = true;
+        updateAllLocalMac();
+    }
 }
 
 void FdbSync::processCfgEvpnNvo()
@@ -1422,22 +1452,13 @@ void FdbSync::onMsgRaw(struct nlmsghdr *msg)
         /* Parse raw for bridge port BACKUP_NHID attribute */
         onMsgLinkRaw(msg);
 
-        /* Also parse via libnl for existing VxLAN interface tracking.
-         * Re-parse the raw message into a libnl nl_msg and dispatch. */
-        struct nl_msg *nlmsg = nlmsg_convert(msg);
-        if (nlmsg)
-        {
-            /* Use nl_msg_parse to get a proper link object */
-            if (nl_msg_parse(nlmsg, [](struct nl_object *obj, void *arg) {
-                FdbSync *sync = (FdbSync *)arg;
-                sync->onMsg(RTM_NEWLINK, obj);
-            }, this) < 0)
-            {
-                /* Parse failed — AF_BRIDGE messages may not parse as rtnl_link,
-                 * that's OK — we still got the raw bridge port info above */
-            }
-            nlmsg_free(nlmsg);
-        }
+        /* Parse raw attributes directly for VxLAN interface tracking.
+         * We cannot rely on nlmsg_convert + nl_msg_parse because libnl
+         * fails to parse RTM_NEWLINK messages that were reconstructed
+         * from raw nlmsghdr bytes (loses internal message metadata).
+         * This was the root cause of m_intf_info never being populated
+         * for VxLAN interfaces like vtep1-10. */
+        onMsgLinkVxlan(msg);
     }
     else if (msg->nlmsg_type == RTM_NEWNEIGH || msg->nlmsg_type == RTM_DELNEIGH)
     {
@@ -1619,6 +1640,103 @@ void FdbSync::updateEsRemoteVteps(const std::string &es_port,
 #ifndef IFLA_BRPORT_BACKUP_NHID
 #define IFLA_BRPORT_BACKUP_NHID 44
 #endif
+
+/*
+ * Parse RTM_NEWLINK raw attributes to detect VxLAN interfaces and populate m_intf_info.
+ * This replaces the broken nlmsg_convert + nl_msg_parse + rtnl_link_is_vxlan path.
+ * Looks for IFLA_LINKINFO → IFLA_INFO_KIND == "vxlan" → IFLA_INFO_DATA → IFLA_VXLAN_ID.
+ */
+void FdbSync::onMsgLinkVxlan(struct nlmsghdr *msg)
+{
+    struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(msg);
+    int len = (int)(msg->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi)));
+
+    if (len < 0)
+        return;
+
+    /* Skip AF_BRIDGE family — those don't carry IFLA_LINKINFO */
+    if (ifi->ifi_family == AF_BRIDGE)
+        return;
+
+    int ifindex = ifi->ifi_index;
+    char ifname_buf[IF_NAMESIZE] = {};
+    bool is_vxlan = false;
+    uint32_t vni = 0;
+
+    /* Parse top-level attributes */
+    struct rtattr *rta = IFLA_RTA(ifi);
+    for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len))
+    {
+        if (rta->rta_type == IFLA_IFNAME)
+        {
+            size_t name_len = RTA_PAYLOAD(rta);
+            if (name_len > 0 && name_len < IF_NAMESIZE)
+            {
+                memcpy(ifname_buf, RTA_DATA(rta), name_len);
+                ifname_buf[name_len - 1] = '\0'; /* ensure null-termination */
+            }
+        }
+        else if (rta->rta_type == IFLA_LINKINFO)
+        {
+            /* Parse nested IFLA_INFO_KIND and IFLA_INFO_DATA */
+            struct rtattr *li_rta = (struct rtattr *)RTA_DATA(rta);
+            int li_len = (int)RTA_PAYLOAD(rta);
+            struct rtattr *info_data = nullptr;
+            int info_data_len = 0;
+
+            for (; RTA_OK(li_rta, li_len); li_rta = RTA_NEXT(li_rta, li_len))
+            {
+                if (li_rta->rta_type == IFLA_INFO_KIND)
+                {
+                    const char *kind = (const char *)RTA_DATA(li_rta);
+                    if (strncmp(kind, "vxlan", 5) == 0)
+                    {
+                        is_vxlan = true;
+                    }
+                }
+                else if (li_rta->rta_type == IFLA_INFO_DATA)
+                {
+                    info_data = (struct rtattr *)RTA_DATA(li_rta);
+                    info_data_len = (int)RTA_PAYLOAD(li_rta);
+                }
+            }
+
+            /* Extract VNI from IFLA_INFO_DATA if this is a vxlan interface */
+            if (is_vxlan && info_data)
+            {
+                struct rtattr *vx_rta = info_data;
+                int vx_len = info_data_len;
+                for (; RTA_OK(vx_rta, vx_len); vx_rta = RTA_NEXT(vx_rta, vx_len))
+                {
+                    /* IFLA_VXLAN_ID = 1 */
+                    if (vx_rta->rta_type == 1 && RTA_PAYLOAD(vx_rta) >= sizeof(uint32_t))
+                    {
+                        vni = *(uint32_t *)RTA_DATA(vx_rta);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!is_vxlan || vni == 0)
+        return;
+
+    /* Resolve ifname if not found in attributes */
+    if (ifname_buf[0] == '\0')
+    {
+        if (if_indextoname(ifindex, ifname_buf) == nullptr)
+        {
+            SWSS_LOG_WARN("onMsgLinkVxlan: cannot resolve ifindex %d", ifindex);
+            return;
+        }
+    }
+
+    SWSS_LOG_NOTICE("onMsgLinkVxlan: VxLAN dev %s ifindex %d vni %u",
+                    ifname_buf, ifindex, vni);
+    m_intf_info[ifindex].vni    = vni;
+    m_intf_info[ifindex].ifname = ifname_buf;
+}
 
 void FdbSync::onMsgLinkRaw(struct nlmsghdr *msg)
 {

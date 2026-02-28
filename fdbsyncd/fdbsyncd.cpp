@@ -96,6 +96,13 @@ int main(int argc, char **argv)
             s.addSelectable(sync.getFdbStateTable());
             s.addSelectable(sync.getMclagRemoteFdbStateTable());
             s.addSelectable(sync.getCfgEvpnNvoTable());
+
+            /* Race-free NVO initialization: subscribe FIRST (above),
+             * then do the direct lookup. Any entry that appears between
+             * subscription and lookup is caught by both paths (idempotent).
+             * This closes the TOCTOU window. */
+            sync.checkExistingEvpnNvo();
+
             while (true)
             {
                 s.select(&temps);

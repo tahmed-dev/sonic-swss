@@ -92,6 +92,7 @@ public:
     void processStateMclagRemoteFdb();
 
     void processCfgEvpnNvo();
+    void checkExistingEvpnNvo();
 
     bool m_reconcileDone = false;
 
@@ -107,6 +108,7 @@ private:
     SubscriberStateTable m_mclagRemoteFdbStateTable;
     AppRestartAssist  *m_AppRestartAssist;
     SubscriberStateTable m_cfgEvpnNvoTable;
+    DBConnector *m_cfgDb;
 
     /* EVPN MH neighbor cache: maps "Vlan<N>:<IP>" → {mac, flags} */
     struct EvpnMhNeighEntry {
@@ -202,6 +204,7 @@ private:
     void onMsgNbrRaw(struct nlmsghdr *msg);
     void onMsgLink(int nlmsg_type, struct nl_object *obj);
     void onMsgLinkRaw(struct nlmsghdr *msg);
+    void onMsgLinkVxlan(struct nlmsghdr *msg);
     void onMsgNhg(struct nlmsghdr *msg);
 
     enum L2NhgType {
