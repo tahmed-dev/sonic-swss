@@ -543,6 +543,16 @@ void FdbOrch::update(sai_fdb_event_t        type,
             }
         }
 
+        /* EVPN MH: if this MAC was just learned on a local ES port, drain
+         * any pending HW FRR routes that were deferred because
+         * getEsPortForVlanNeighbor couldn't resolve via FDB at the time. */
+        if (gEvpnMhOrch &&
+            gEvpnMhOrch->isPortInterfaceAssociatedToEs(update.port.m_alias))
+        {
+            gEvpnMhOrch->retryPendingHwFrrRoutes(update.port.m_alias,
+                                                   update.entry.mac);
+        }
+
         notify(SUBJECT_TYPE_FDB_CHANGE, &update);
         if (mac_move_local)
         {
@@ -1579,6 +1589,15 @@ void FdbOrch::flushAllFDBEntries(sai_object_id_t bridge_port_oid,
         }
     }
 }
+bool FdbOrch::getFdbEntry(const FdbEntry &entry, FdbData &data)
+{
+    auto it = m_entries.find(entry);
+    if (it == m_entries.end())
+        return false;
+    data = it->second;
+    return true;
+}
+
 void FdbOrch::flushFdbByVlan(const string &alias)
 {
     sai_status_t status;
@@ -1671,9 +1690,14 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
             }
             else if (mode == EvpnMhFailoverMode::L3)
             {
-                SWSS_LOG_NOTICE("EVPN MH L3 failover: port %s is ES member, injecting host routes",
+                SWSS_LOG_NOTICE("EVPN MH L3 failover: port %s down — swapping L3 routes to standby NHG",
                     p.m_alias.c_str());
-                evpnMhInjectHostRoutes(p.m_alias);
+                gEvpnMhOrch->handleHwFrrLocalPortDown(p.m_alias);
+
+                SWSS_LOG_NOTICE("EVPN MH L3 failover: port %s down — rerouting L2 FDB to tunnel",
+                    p.m_alias.c_str());
+                evpnMhRerouteToTunnel(p);
+                return;
             }
             else
             {
@@ -1727,6 +1751,24 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
                     !m_reroutedEntries[p.m_alias].empty())
                 {
                     SWSS_LOG_NOTICE("EVPN MH HW restore: port %s up — restoring L2 FDB from tunnel",
+                        p.m_alias.c_str());
+                    evpnMhRestoreFromTunnel(p);
+                }
+                return;
+            }
+
+            if (mode == EvpnMhFailoverMode::L3)
+            {
+                /* L3 FRR: Restore L3 routes from standby NHG back to PROTECTION NHG */
+                SWSS_LOG_NOTICE("EVPN MH L3 restore: port %s up — restoring L3 routes to PROTECTION NHG",
+                    p.m_alias.c_str());
+                gEvpnMhOrch->handleHwFrrLocalPortUp(p.m_alias);
+
+                /* Also restore L2 FDB entries back to the local port */
+                if (m_reroutedEntries.find(p.m_alias) != m_reroutedEntries.end() &&
+                    !m_reroutedEntries[p.m_alias].empty())
+                {
+                    SWSS_LOG_NOTICE("EVPN MH L3 restore: port %s up — restoring L2 FDB from tunnel",
                         p.m_alias.c_str());
                     evpnMhRestoreFromTunnel(p);
                 }
