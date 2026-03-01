@@ -1655,46 +1655,13 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
             return;
         }
 
-        /* EVPN MH: If this port is an ES member, reroute MACs to VxLAN
-         * tunnel instead of flushing them. This provides fast failover. */
+        /* EVPN MH v2.0: If this port is an ES member, failover is handled
+         * by VPP's es-protect virtual interface — no software reroute needed.
+         * Just log and return (don't flush FDB). */
         if (gEvpnMhOrch && gEvpnMhOrch->isPortInterfaceAssociatedToEs(p.m_alias))
         {
-            auto mode = gEvpnMhOrch->getEffectiveFailoverMode(p.m_alias);
-            if (mode == EvpnMhFailoverMode::HW)
-            {
-                /* HW FRR: VPP doesn't natively implement MONITORED_OBJECT for
-                 * PROTECTION NHGs, so we trigger the failover from software:
-                 * swap each server IP route from PROTECTION NHG to standby
-                 * ECMP NHG (tunnel-only paths to peer T1s). */
-                SWSS_LOG_NOTICE("EVPN MH HW failover: port %s down — swapping L3 routes to standby NHG",
-                    p.m_alias.c_str());
-                gEvpnMhOrch->handleHwFrrLocalPortDown(p.m_alias);
-
-                /* Also reroute L2 FDB entries from the downed port to the
-                 * VxLAN tunnel so cross-server (intra-subnet) traffic is
-                 * carried via the peer T1 during failover. */
-                SWSS_LOG_NOTICE("EVPN MH HW failover: port %s down — rerouting L2 FDB to tunnel",
-                    p.m_alias.c_str());
-                evpnMhRerouteToTunnel(p);
-                return;
-            }
-            else if (mode == EvpnMhFailoverMode::L3)
-            {
-                SWSS_LOG_NOTICE("EVPN MH L3 failover: port %s down — swapping L3 routes to standby NHG",
-                    p.m_alias.c_str());
-                gEvpnMhOrch->handleHwFrrLocalPortDown(p.m_alias);
-
-                SWSS_LOG_NOTICE("EVPN MH L3 failover: port %s down — rerouting L2 FDB to tunnel",
-                    p.m_alias.c_str());
-                evpnMhRerouteToTunnel(p);
-                return;
-            }
-            else
-            {
-                SWSS_LOG_NOTICE("EVPN MH L2 failover: port %s is ES member, rerouting to tunnel",
-                    p.m_alias.c_str());
-                evpnMhRerouteToTunnel(p);
-            }
+            SWSS_LOG_NOTICE("EVPN MH v2.0: port %s down, failover handled by VPP es-protect",
+                p.m_alias.c_str());
             return;
         }
 
@@ -1723,65 +1690,12 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
     {
         swss::Port p = update.port;
 
-        /* EVPN MH: If this port was previously failed over, restore MACs
-         * back to the local port from the VxLAN tunnel. */
+        /* EVPN MH v2.0: If this port is an ES member, restore is handled
+         * by VPP's es-protect virtual interface — no software restore needed. */
         if (gEvpnMhOrch && gEvpnMhOrch->isPortInterfaceAssociatedToEs(p.m_alias))
         {
-            auto mode = gEvpnMhOrch->getEffectiveFailoverMode(p.m_alias);
-            if (mode == EvpnMhFailoverMode::HW)
-            {
-                /* HW FRR: Restore L3 routes from standby NHG back to the full
-                 * PROTECTION NHG (primary local path + standby tunnel). */
-                SWSS_LOG_NOTICE("EVPN MH HW restore: port %s up — restoring L3 routes to PROTECTION NHG",
-                    p.m_alias.c_str());
-                gEvpnMhOrch->handleHwFrrLocalPortUp(p.m_alias);
-
-                /* Also restore L2 FDB entries back to the local port */
-                if (m_reroutedEntries.find(p.m_alias) != m_reroutedEntries.end() &&
-                    !m_reroutedEntries[p.m_alias].empty())
-                {
-                    SWSS_LOG_NOTICE("EVPN MH HW restore: port %s up — restoring L2 FDB from tunnel",
-                        p.m_alias.c_str());
-                    evpnMhRestoreFromTunnel(p);
-                }
-                return;
-            }
-
-            if (mode == EvpnMhFailoverMode::L3)
-            {
-                /* L3 FRR: Restore L3 routes from standby NHG back to PROTECTION NHG */
-                SWSS_LOG_NOTICE("EVPN MH L3 restore: port %s up — restoring L3 routes to PROTECTION NHG",
-                    p.m_alias.c_str());
-                gEvpnMhOrch->handleHwFrrLocalPortUp(p.m_alias);
-
-                /* Also restore L2 FDB entries back to the local port */
-                if (m_reroutedEntries.find(p.m_alias) != m_reroutedEntries.end() &&
-                    !m_reroutedEntries[p.m_alias].empty())
-                {
-                    SWSS_LOG_NOTICE("EVPN MH L3 restore: port %s up — restoring L2 FDB from tunnel",
-                        p.m_alias.c_str());
-                    evpnMhRestoreFromTunnel(p);
-                }
-                return;
-            }
-
-            /* Withdraw L3 host routes if any were injected */
-            if (m_l3ReroutedEntries.find(p.m_alias) != m_l3ReroutedEntries.end() &&
-                !m_l3ReroutedEntries[p.m_alias].empty())
-            {
-                SWSS_LOG_NOTICE("EVPN MH L3 restore: port %s is back up, withdrawing host routes",
-                    p.m_alias.c_str());
-                evpnMhWithdrawHostRoutes(p.m_alias);
-            }
-
-            /* Restore L2 rerouted MACs if any */
-            if (m_reroutedEntries.find(p.m_alias) != m_reroutedEntries.end() &&
-                !m_reroutedEntries[p.m_alias].empty())
-            {
-                SWSS_LOG_NOTICE("EVPN MH L2 restore: port %s is back up, restoring MACs from tunnel",
-                    p.m_alias.c_str());
-                evpnMhRestoreFromTunnel(p);
-            }
+            SWSS_LOG_NOTICE("EVPN MH v2.0: port %s up, restore handled by VPP es-protect",
+                p.m_alias.c_str());
         }
     }
     return;
@@ -1789,218 +1703,18 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
 
 void FdbOrch::evpnMhRerouteToTunnel(const Port& downPort)
 {
-    SWSS_LOG_ENTER();
-
-    /* Find the peer VTEP to reroute traffic to */
-    string peer_vtep = gEvpnMhOrch->getPeerVtepForEsPortConfig(downPort.m_alias);
-    if (peer_vtep.empty())
-    {
-        SWSS_LOG_ERROR("EVPN MH failover: no peer VTEP for port %s, falling back to flush",
-            downPort.m_alias.c_str());
-        /* Fall back to normal flush behavior */
-        if (downPort.m_bridge_port_id != SAI_NULL_OBJECT_ID)
-        {
-            flushFDBEntries(downPort.m_bridge_port_id, SAI_NULL_OBJECT_ID);
-        }
-        return;
-    }
-
-    /* Get the tunnel port name for the peer VTEP */
-    VxlanTunnelOrch* tunnel_orch = gDirectory.get<VxlanTunnelOrch*>();
-    string tunnel_port_name;
-    if (tunnel_orch->isDipTunnelsSupported())
-    {
-        tunnel_port_name = tunnel_orch->getTunnelPortName(peer_vtep);
-    }
-    else
-    {
-        EvpnNvoOrch* evpn_nvo_orch = gDirectory.get<EvpnNvoOrch*>();
-        VxlanTunnel* sip_tunnel = evpn_nvo_orch->getEVPNVtep();
-        if (sip_tunnel)
-        {
-            tunnel_port_name = tunnel_orch->getTunnelPortName(
-                sip_tunnel->getSrcIP().to_string(), true);
-        }
-    }
-
-    Port tunnelPort;
-    if (tunnel_port_name.empty() || !m_portsOrch->getPort(tunnel_port_name, tunnelPort))
-    {
-        SWSS_LOG_ERROR("EVPN MH failover: tunnel port for VTEP %s not found, falling back to flush",
-            peer_vtep.c_str());
-        if (downPort.m_bridge_port_id != SAI_NULL_OBJECT_ID)
-        {
-            flushFDBEntries(downPort.m_bridge_port_id, SAI_NULL_OBJECT_ID);
-        }
-        return;
-    }
-
-    SWSS_LOG_NOTICE("EVPN MH failover: rerouting MACs from port %s to tunnel %s (VTEP %s)",
-        downPort.m_alias.c_str(), tunnel_port_name.c_str(), peer_vtep.c_str());
-
-    /* Save and reroute each FDB entry on this port */
-    vector<ReroutedFdbEntry> rerouted;
-    auto port_entries_it = m_entries_by_port.find(downPort.m_alias);
-    if (port_entries_it == m_entries_by_port.end())
-    {
-        SWSS_LOG_NOTICE("EVPN MH failover: no FDB entries on port %s", downPort.m_alias.c_str());
-        return;
-    }
-
-    /* Copy entries to avoid iterator invalidation */
-    auto fdb_list = port_entries_it->second;
-
-    for (const auto& fdbEntry : fdb_list)
-    {
-        auto entry_it = m_entries.find(fdbEntry);
-        if (entry_it == m_entries.end())
-        {
-            continue;
-        }
-
-        /* Save original entry for restore */
-        ReroutedFdbEntry saved;
-        saved.entry = fdbEntry;
-        saved.origData = entry_it->second;
-
-        /* Remove old FDB entry from SAI */
-        sai_fdb_entry_t sai_fdb_entry;
-        sai_fdb_entry.switch_id = gSwitchId;
-        memcpy(sai_fdb_entry.mac_address, fdbEntry.mac.getMac(), sizeof(sai_mac_t));
-        sai_fdb_entry.bv_id = fdbEntry.bv_id;
-
-        sai_status_t status = sai_fdb_api->remove_fdb_entry(&sai_fdb_entry);
-        if (status != SAI_STATUS_SUCCESS)
-        {
-            SWSS_LOG_ERROR("EVPN MH failover: failed to remove FDB entry mac=%s, status=%d",
-                fdbEntry.mac.to_string().c_str(), status);
-            continue;
-        }
-
-        /* Create new FDB entry pointing to tunnel */
-        vector<sai_attribute_t> attrs;
-        sai_attribute_t attr;
-
-        attr.id = SAI_FDB_ENTRY_ATTR_TYPE;
-        attr.value.s32 = SAI_FDB_ENTRY_TYPE_STATIC;
-        attrs.push_back(attr);
-
-        attr.id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
-        attr.value.oid = tunnelPort.m_bridge_port_id;
-        attrs.push_back(attr);
-
-        string end_point_ip = "";
-        if (!tunnel_orch->isDipTunnelsSupported())
-        {
-            attr.id = SAI_FDB_ENTRY_ATTR_ENDPOINT_IP;
-            IpAddress ip(peer_vtep);
-            sai_ip_address_t sai_ip;
-            sai_ip.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
-            sai_ip.addr.ip4 = ip.getV4Addr();
-            attr.value.ipaddr = sai_ip;
-            attrs.push_back(attr);
-        }
-
-        status = sai_fdb_api->create_fdb_entry(&sai_fdb_entry, (uint32_t)attrs.size(), attrs.data());
-        if (status != SAI_STATUS_SUCCESS)
-        {
-            SWSS_LOG_ERROR("EVPN MH failover: failed to create tunnel FDB entry mac=%s, status=%d",
-                fdbEntry.mac.to_string().c_str(), status);
-            continue;
-        }
-
-        SWSS_LOG_NOTICE("EVPN MH failover: rerouted mac=%s to tunnel %s",
-            fdbEntry.mac.to_string().c_str(), tunnel_port_name.c_str());
-
-        /* Update internal cache */
-        FdbData newData = entry_it->second;
-        newData.bridge_port_id = tunnelPort.m_bridge_port_id;
-        newData.origin = FDB_ORIGIN_VXLAN_ADVERTIZED;
-        newData.dest_type = VTEP;
-        newData.dest_value = peer_vtep;
-        newData.type = "static";
-
-        /* Remove from old port's entry list */
-        removeFdbEntryFromPortCache(fdbEntry, downPort);
-
-        /* Update the main entry */
-        m_entries[fdbEntry] = newData;
-
-        /* Add to tunnel port's entry list */
-        m_entries_by_port[tunnel_port_name].push_back(fdbEntry);
-
-        rerouted.push_back(saved);
-    }
-
-    m_reroutedEntries[downPort.m_alias] = std::move(rerouted);
-
-    SWSS_LOG_NOTICE("EVPN MH failover: rerouted %zu MACs from port %s to tunnel %s",
-        m_reroutedEntries[downPort.m_alias].size(),
-        downPort.m_alias.c_str(), tunnel_port_name.c_str());
+    /* v2.0: Failover handled by VPP es-protect virtual interface.
+     * No control-plane reroute needed. */
+    SWSS_LOG_NOTICE("EVPN MH v2.0: port %s down, failover handled by VPP es-protect",
+                    downPort.m_alias.c_str());
 }
 
 void FdbOrch::evpnMhRestoreFromTunnel(const Port& upPort)
 {
-    SWSS_LOG_ENTER();
-
-    auto it = m_reroutedEntries.find(upPort.m_alias);
-    if (it == m_reroutedEntries.end() || it->second.empty())
-    {
-        return;
-    }
-
-    size_t restored = 0;
-    for (const auto& rerouted : it->second)
-    {
-        /* Remove the tunnel FDB entry */
-        sai_fdb_entry_t sai_fdb_entry;
-        sai_fdb_entry.switch_id = gSwitchId;
-        memcpy(sai_fdb_entry.mac_address, rerouted.entry.mac.getMac(), sizeof(sai_mac_t));
-        sai_fdb_entry.bv_id = rerouted.entry.bv_id;
-
-        sai_status_t status = sai_fdb_api->remove_fdb_entry(&sai_fdb_entry);
-        if (status != SAI_STATUS_SUCCESS)
-        {
-            SWSS_LOG_ERROR("EVPN MH restore: failed to remove tunnel FDB entry mac=%s, status=%d",
-                rerouted.entry.mac.to_string().c_str(), status);
-            continue;
-        }
-
-        /* Re-create original FDB entry pointing to local port */
-        vector<sai_attribute_t> attrs;
-        sai_attribute_t attr;
-
-        attr.id = SAI_FDB_ENTRY_ATTR_TYPE;
-        attr.value.s32 = (rerouted.origData.type == "static") ?
-            SAI_FDB_ENTRY_TYPE_STATIC : SAI_FDB_ENTRY_TYPE_DYNAMIC;
-        attrs.push_back(attr);
-
-        attr.id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
-        attr.value.oid = upPort.m_bridge_port_id;
-        attrs.push_back(attr);
-
-        status = sai_fdb_api->create_fdb_entry(&sai_fdb_entry, (uint32_t)attrs.size(), attrs.data());
-        if (status != SAI_STATUS_SUCCESS)
-        {
-            SWSS_LOG_ERROR("EVPN MH restore: failed to restore FDB entry mac=%s, status=%d",
-                rerouted.entry.mac.to_string().c_str(), status);
-            continue;
-        }
-
-        /* Update internal cache back to original */
-        m_entries[rerouted.entry] = rerouted.origData;
-        m_entries[rerouted.entry].bridge_port_id = upPort.m_bridge_port_id;
-        m_entries_by_port[upPort.m_alias].push_back(rerouted.entry);
-        restored++;
-
-        SWSS_LOG_NOTICE("EVPN MH restore: restored mac=%s to port %s",
-            rerouted.entry.mac.to_string().c_str(), upPort.m_alias.c_str());
-    }
-
-    SWSS_LOG_NOTICE("EVPN MH restore: restored %zu/%zu MACs to port %s",
-        restored, it->second.size(), upPort.m_alias.c_str());
-
-    m_reroutedEntries.erase(it);
+    /* v2.0: Restore handled by VPP es-protect virtual interface.
+     * No control-plane restore needed. */
+    SWSS_LOG_NOTICE("EVPN MH v2.0: port %s up, restore handled by VPP es-protect",
+                    upPort.m_alias.c_str());
 }
 
 void FdbOrch::updateVlanMember(const VlanMemberUpdate& update)
@@ -2752,145 +2466,8 @@ void FdbOrch::notifyTunnelOrch(Port& port)
  */
 void FdbOrch::evpnMhInjectHostRoutes(const string &port_alias)
 {
-    SWSS_LOG_ENTER();
-
-    string peer_vtep = gEvpnMhOrch->getPeerVtepForEsPortConfig(port_alias);
-    if (peer_vtep.empty())
-    {
-        SWSS_LOG_ERROR("EVPN MH L3 failover: no peer VTEP for port %s, falling back to L2",
-            port_alias.c_str());
-        Port p;
-        if (m_portsOrch->getPort(port_alias, p))
-        {
-            evpnMhRerouteToTunnel(p);
-        }
-        return;
-    }
-
-    /* Check if the peer VTEP still has the ES active.  If both T1s lost
-     * their PortChannel to the server, injecting a tunnel route would
-     * create a black hole.  In that case, don't inject and don't fall
-     * back to L2 — the server is truly unreachable. */
-    if (!gEvpnMhOrch->isPeerEsActive(port_alias))
-    {
-        SWSS_LOG_NOTICE("EVPN MH L3 failover: peer also lost ES for port %s, "
-            "server unreachable — not injecting routes", port_alias.c_str());
-        return;
-    }
-
-    sai_object_id_t tunnel_nh = gEvpnMhOrch->getL3TunnelNexthop(peer_vtep);
-    if (tunnel_nh == SAI_NULL_OBJECT_ID)
-    {
-        SWSS_LOG_ERROR("EVPN MH L3 failover: failed to get tunnel nexthop for %s, falling back to L2",
-            peer_vtep.c_str());
-        Port p;
-        if (m_portsOrch->getPort(port_alias, p))
-        {
-            evpnMhRerouteToTunnel(p);
-        }
-        return;
-    }
-
-    sai_object_id_t vrf_oid = gEvpnMhOrch->getVrfOidForEsPort(port_alias);
-    if (vrf_oid == SAI_NULL_OBJECT_ID)
-    {
-        SWSS_LOG_ERROR("EVPN MH L3 failover: no VRF for port %s, falling back to L2",
-            port_alias.c_str());
-        Port p;
-        if (m_portsOrch->getPort(port_alias, p))
-        {
-            evpnMhRerouteToTunnel(p);
-        }
-        return;
-    }
-
-    /*
-     * Get server IPs behind this port. Prefer static config (server_ipv4 in
-     * EVPN_ETHERNET_SEGMENT) over dynamic neighbor discovery. Static config
-     * is deterministic and doesn't depend on sparse neighbor/FDB tables.
-     */
-    auto server_ips = gEvpnMhOrch->getServerIpsForEsPort(port_alias);
-    if (server_ips.empty())
-    {
-        /* Fall back to neighbor-based discovery (legacy path) */
-        auto neighbors = getNeighborsOnPort(port_alias);
-        if (neighbors.empty())
-        {
-            /* Try EVPN Type-2 MAC+IP routes from FRR as third source */
-            neighbors = getNeighborsFromEvpnType2(port_alias);
-            if (neighbors.empty())
-            {
-                SWSS_LOG_NOTICE("EVPN MH L3 failover: no server IPs, neighbors, or EVPN Type-2 entries for port %s, falling back to L2",
-                    port_alias.c_str());
-                Port p;
-                if (m_portsOrch->getPort(port_alias, p))
-                {
-                    evpnMhRerouteToTunnel(p);
-                }
-                return;
-            }
-            SWSS_LOG_NOTICE("EVPN MH L3 failover: using %zu EVPN Type-2 neighbors for port %s",
-                neighbors.size(), port_alias.c_str());
-        }
-        else
-        {
-            SWSS_LOG_NOTICE("EVPN MH L3 failover: using %zu APPL_DB neighbors for port %s",
-                neighbors.size(), port_alias.c_str());
-        }
-        /* Convert neighbors to IpPrefix list */
-        for (const auto &nbr : neighbors)
-        {
-            const auto &ip = nbr.first;
-            server_ips.push_back(IpPrefix(ip.to_string() + (ip.isV4() ? "/32" : "/128")));
-        }
-        SWSS_LOG_NOTICE("EVPN MH L3 failover: using %zu neighbors (no static config) for port %s",
-            server_ips.size(), port_alias.c_str());
-    }
-    else
-    {
-        SWSS_LOG_NOTICE("EVPN MH L3 failover: using %zu static server IPs for port %s",
-            server_ips.size(), port_alias.c_str());
-    }
-
-    SWSS_LOG_NOTICE("EVPN MH L3 failover: injecting %zu host routes for port %s via VTEP %s",
-        server_ips.size(), port_alias.c_str(), peer_vtep.c_str());
-
-    vector<L3ReroutedEntry> rerouted;
-
-    for (const auto &host_prefix : server_ips)
-    {
-        sai_route_entry_t route_entry;
-        route_entry.switch_id = gSwitchId;
-        route_entry.vr_id = vrf_oid;
-        copy(route_entry.destination, host_prefix);
-
-        auto pfx_str = host_prefix.to_string();
-
-        sai_attribute_t attr;
-        attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
-        attr.value.oid = tunnel_nh;
-
-        sai_status_t status = sai_route_api->create_route_entry(&route_entry, 1, &attr);
-        if (status != SAI_STATUS_SUCCESS)
-        {
-            SWSS_LOG_ERROR("EVPN MH L3 failover: failed to create route for %s, status %d",
-                pfx_str.c_str(), status);
-            continue;
-        }
-
-        SWSS_LOG_NOTICE("EVPN MH L3 failover: injected route %s → tunnel NH 0x%" PRIx64,
-            pfx_str.c_str(), tunnel_nh);
-
-        L3ReroutedEntry rentry;
-        rentry.prefix = host_prefix;
-        rentry.vrf_oid = vrf_oid;
-        rerouted.push_back(rentry);
-    }
-
-    if (!rerouted.empty())
-    {
-        m_l3ReroutedEntries[port_alias] = rerouted;
-    }
+    /* v2.0: Host route injection removed. Failover handled by VPP es-protect. */
+    SWSS_LOG_NOTICE("EVPN MH v2.0: evpnMhInjectHostRoutes stub for %s", port_alias.c_str());
 }
 
 /*
@@ -2898,39 +2475,8 @@ void FdbOrch::evpnMhInjectHostRoutes(const string &port_alias)
  */
 void FdbOrch::evpnMhWithdrawHostRoutes(const string &port_alias)
 {
-    SWSS_LOG_ENTER();
-
-    auto it = m_l3ReroutedEntries.find(port_alias);
-    if (it == m_l3ReroutedEntries.end())
-        return;
-
-    SWSS_LOG_NOTICE("EVPN MH L3 restore: withdrawing %zu host routes for port %s",
-        it->second.size(), port_alias.c_str());
-
-    for (const auto &entry : it->second)
-    {
-        const auto &prefix = entry.prefix;
-        const auto &vrf_oid = entry.vrf_oid;
-        sai_route_entry_t route_entry;
-        route_entry.switch_id = gSwitchId;
-        route_entry.vr_id = vrf_oid;
-        copy(route_entry.destination, prefix);
-
-        auto pfx_str = prefix.to_string();
-
-        sai_status_t status = sai_route_api->remove_route_entry(&route_entry);
-        if (status != SAI_STATUS_SUCCESS)
-        {
-            SWSS_LOG_ERROR("EVPN MH L3 restore: failed to remove route %s, status %d",
-                pfx_str.c_str(), status);
-        }
-        else
-        {
-            SWSS_LOG_NOTICE("EVPN MH L3 restore: removed route %s", pfx_str.c_str());
-        }
-    }
-
-    m_l3ReroutedEntries.erase(it);
+    /* v2.0: Host route withdrawal removed. Failover handled by VPP es-protect. */
+    SWSS_LOG_NOTICE("EVPN MH v2.0: evpnMhWithdrawHostRoutes stub for %s", port_alias.c_str());
 }
 
 /*

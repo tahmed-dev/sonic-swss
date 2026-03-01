@@ -1379,28 +1379,8 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
         is_nbr_active = mux_orch->isNeighborActive(ip_address, macAddress, alias);
     }
 
-    /* EVPN MH HW FRR: suppress automatic /32 host route for server IPs
-     * behind ES ports with HW failover mode.  The /32 route is owned
-     * exclusively by evpnmhorch's PROTECTION NHG. */
-    if (gEvpnMhOrch && gEvpnMhOrch->isHwFrrServerIp(ip_address))
-    {
-        /* Check if NO_HOST_ROUTE was already added (e.g. by link-local check) */
-        bool already_set = false;
-        for (auto const &a : neighbor_attrs)
-        {
-            if (a.id == SAI_NEIGHBOR_ENTRY_ATTR_NO_HOST_ROUTE)
-            {
-                already_set = true;
-                break;
-            }
-        }
-        if (!already_set)
-        {
-            no_host_route = true;
-            SWSS_LOG_NOTICE("EVPN MH HW FRR: setting NO_HOST_ROUTE for server IP %s on %s",
-                            ip_address.to_string().c_str(), alias.c_str());
-        }
-    }
+    /* EVPN MH v2.0: NO_HOST_ROUTE suppression removed.
+     * Protection NHG and /32 routes are no longer used. */
 
     if (no_host_route)
     {
@@ -1607,21 +1587,8 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
 
     m_syncdNeighbors[neighborEntry] = { macAddress, hw_config, 0, prefix_route };
 
-    /* EVPN MH: dynamically add /32 server route to protection NHG when a
-     * neighbor is learned on a VLAN interface associated with an ES port. */
-    if (gEvpnMhOrch && is_alias_vlan && !ip_address.isZero() &&
-        ip_address.getAddrScope() != IpAddress::LINK_SCOPE)
-    {
-        std::string es_port = gEvpnMhOrch->getEsPortForVlanNeighbor(alias, ip_address, macAddress);
-        if (!es_port.empty())
-        {
-            auto mode = gEvpnMhOrch->getEffectiveFailoverMode(es_port);
-            if (mode == EvpnMhFailoverMode::HW || mode == EvpnMhFailoverMode::L3)
-            {
-                gEvpnMhOrch->addHwFrrServerRoute(es_port, ip_address);
-            }
-        }
-    }
+    /* EVPN MH v2.0: server route management removed.
+     * Failover is handled by VPP es-protect virtual interface. */
 
     NeighborUpdate update = { neighborEntry, macAddress, true };
     notify(SUBJECT_TYPE_NEIGH_CHANGE, static_cast<void *>(&update));
@@ -1808,16 +1775,8 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
 
     m_syncdNeighbors.erase(neighborEntry);
 
-    /* EVPN MH: remove /32 server route from protection NHG when neighbor is removed */
-    if (gEvpnMhOrch && !ip_address.isZero() &&
-        ip_address.getAddrScope() != IpAddress::LINK_SCOPE)
-    {
-        std::string es_port = gEvpnMhOrch->getEsPortForVlanNeighbor(alias, ip_address);
-        if (!es_port.empty())
-        {
-            gEvpnMhOrch->removeHwFrrServerRoute(es_port, ip_address);
-        }
-    }
+    /* EVPN MH v2.0: server route management removed.
+     * Failover is handled by VPP es-protect virtual interface. */
 
     // TODO: added || isChassisDbInUse()) to Cisco PR
     if (gMySwitchType == "voq" || isChassisDbInUse())
