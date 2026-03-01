@@ -83,7 +83,8 @@ public:
     sai_status_t removeHwFrrServerRoute(const std::string &es_port, const IpAddress &server_ip);
 
     /* Find the ES port for a given VLAN + neighbor IP (for neighorch callback) */
-    std::string getEsPortForVlanNeighbor(const std::string &vlan_alias, const IpAddress &ip);
+    std::string getEsPortForVlanNeighbor(const std::string &vlan_alias, const IpAddress &ip,
+                                         const MacAddress &mac = MacAddress());
 
     /* Check if the peer VTEP still has the ES active (via FRR zebra) */
     bool isPeerEsActive(const std::string &port_name);

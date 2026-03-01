@@ -1579,6 +1579,15 @@ void FdbOrch::flushAllFDBEntries(sai_object_id_t bridge_port_oid,
         }
     }
 }
+bool FdbOrch::getFdbEntry(const FdbEntry &entry, FdbData &data)
+{
+    auto it = m_entries.find(entry);
+    if (it == m_entries.end())
+        return false;
+    data = it->second;
+    return true;
+}
+
 void FdbOrch::flushFdbByVlan(const string &alias)
 {
     sai_status_t status;

@@ -11,7 +11,10 @@
 #include "directory.h"
 #include "vxlanorch.h"
 #include "vrforch.h"
+#include "fdborch.h"
 #include "schema.h"
+
+extern FdbOrch *gFdbOrch;
 #include "dbconnector.h"
 #include "table.h"
 
@@ -1783,8 +1786,44 @@ sai_status_t EvpnMhOrch::handleHwFrrLocalPortUp(const std::string &es_port)
  * Find the ES port associated with a VLAN neighbor.  Checks all ES ports'
  * VLAN membership to find which ES port is on this VLAN.
  */
-std::string EvpnMhOrch::getEsPortForVlanNeighbor(const std::string &vlan_alias, const IpAddress &ip)
+std::string EvpnMhOrch::getEsPortForVlanNeighbor(const std::string &vlan_alias, const IpAddress &ip,
+                                                  const MacAddress &mac)
 {
+    /* First, try to find the ES port via the FDB: look up which PortChannel
+     * the neighbor's MAC is learned on. This is the correct mapping when
+     * multiple ES ports share the same VLAN (e.g. two PortChannels in Vlan10). */
+    if (gFdbOrch && mac)
+    {
+        Port vlan_port;
+        if (gPortsOrch->getPort(vlan_alias, vlan_port))
+        {
+            FdbEntry fdb_entry;
+            fdb_entry.mac = mac;
+            fdb_entry.bv_id = vlan_port.m_vlan_info.vlan_oid;
+            FdbData fdb_data;
+            if (gFdbOrch->getFdbEntry(fdb_entry, fdb_data))
+            {
+                /* Find which ES port owns this bridge_port_id */
+                for (const auto &es_entry : m_esIntfMap)
+                {
+                    Port es_port_obj;
+                    if (!gPortsOrch->getPort(es_entry.first, es_port_obj))
+                        continue;
+                    if (es_port_obj.m_bridge_port_id == fdb_data.bridge_port_id)
+                    {
+                        SWSS_LOG_NOTICE("getEsPortForVlanNeighbor: IP %s MAC %s → %s (via FDB)",
+                                        ip.to_string().c_str(), mac.to_string().c_str(),
+                                        es_entry.first.c_str());
+                        return es_entry.first;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Fallback: return the first ES port that is a member of the given VLAN.
+     * This works when there's only one ES port per VLAN, or when the FDB
+     * hasn't learned the MAC yet. */
     for (const auto &es_entry : m_esIntfMap)
     {
         const std::string &port_name = es_entry.first;
@@ -1801,6 +1840,8 @@ std::string EvpnMhOrch::getEsPortForVlanNeighbor(const std::string &vlan_alias, 
             std::string member_vlan = std::string(VLAN_PREFIX) + std::to_string(member.first);
             if (member_vlan == vlan_alias)
             {
+                SWSS_LOG_NOTICE("getEsPortForVlanNeighbor: IP %s → %s (fallback, VLAN membership)",
+                                ip.to_string().c_str(), port_name.c_str());
                 return port_name;
             }
         }

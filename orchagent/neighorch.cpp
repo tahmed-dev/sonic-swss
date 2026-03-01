@@ -1612,7 +1612,7 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
     if (gEvpnMhOrch && is_alias_vlan && !ip_address.isZero() &&
         ip_address.getAddrScope() != IpAddress::LINK_SCOPE)
     {
-        std::string es_port = gEvpnMhOrch->getEsPortForVlanNeighbor(alias, ip_address);
+        std::string es_port = gEvpnMhOrch->getEsPortForVlanNeighbor(alias, ip_address, macAddress);
         if (!es_port.empty())
         {
             auto mode = gEvpnMhOrch->getEffectiveFailoverMode(es_port);
