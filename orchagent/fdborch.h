@@ -127,6 +127,8 @@ public:
     void flushFdbByVlan(const string &);
     void notifyObserversFDBFlush(Port &p, sai_object_id_t&);
 
+    bool getFdbEntry(const FdbEntry &entry, FdbData &data);
+
 private:
     PortsOrch *m_portsOrch;
     map<FdbEntry, FdbData> m_entries;

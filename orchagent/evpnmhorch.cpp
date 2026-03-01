@@ -7,10 +7,14 @@
 
 #include "portsorch.h"
 #include "neighorch.h"
+#include "intfsorch.h"
 #include "directory.h"
 #include "vxlanorch.h"
 #include "vrforch.h"
+#include "fdborch.h"
 #include "schema.h"
+
+extern FdbOrch *gFdbOrch;
 #include "dbconnector.h"
 #include "table.h"
 
@@ -383,10 +387,11 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
                 continue;
             }
 
-            /* HW FRR: create protection groups if configured */
+            /* HW/L3 FRR: create protection groups if configured */
             auto mode_it = m_esFailoverMode.find(key);
             if (mode_it != m_esFailoverMode.end() &&
-                mode_it->second == EvpnMhFailoverMode::HW)
+                (mode_it->second == EvpnMhFailoverMode::HW ||
+                 mode_it->second == EvpnMhFailoverMode::L3))
             {
                 sai_status_t status = createHwFrrProtectionGroups(key);
                 if (status != SAI_STATUS_SUCCESS)
@@ -787,10 +792,12 @@ std::vector<IpPrefix> EvpnMhOrch::getServerIpsForEsPort(const std::string &port_
 
 bool EvpnMhOrch::isHwFrrServerIp(const IpAddress &ip)
 {
+    /* Check static server IPs from ConfigDB */
     for (auto const &es_entry : m_esServerIps)
     {
         const std::string &port_name = es_entry.first;
-        if (getEffectiveFailoverMode(port_name) != EvpnMhFailoverMode::HW)
+        auto mode = getEffectiveFailoverMode(port_name);
+        if (mode != EvpnMhFailoverMode::HW && mode != EvpnMhFailoverMode::L3)
         {
             continue;
         }
@@ -802,6 +809,23 @@ bool EvpnMhOrch::isHwFrrServerIp(const IpAddress &ip)
             }
         }
     }
+
+    /* Check dynamically added routes in protection groups (HW mode only —
+     * L3 mode needs adjacency-sourced /32 for VPP NH resolution) */
+    for (auto const &state_entry : m_hwFrrState)
+    {
+        auto mode = getEffectiveFailoverMode(state_entry.first);
+        if (mode != EvpnMhFailoverMode::HW)
+            continue;
+        for (auto const &route : state_entry.second.server_routes)
+        {
+            if (route.server_ip.getIp() == ip)
+            {
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 
@@ -1138,11 +1162,9 @@ sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
     }
 
     auto server_ips = getServerIpsForEsPort(es_port);
-    if (server_ips.empty())
-    {
-        SWSS_LOG_ERROR("HW FRR: no server_ipv4 for ES port %s", es_port.c_str());
-        return SAI_STATUS_FAILURE;
-    }
+    /* server_ips may be empty for L3 mode — /32 routes are added dynamically
+     * as neighbors appear via EVPN Type-2. Protection NHG infrastructure is
+     * still created; routes are installed later via addHwFrrServerRoute(). */
 
     /* Get VRF OID for route programming */
     sai_object_id_t vrf_oid = getVrfOidForEsPort(es_port);
@@ -1271,10 +1293,27 @@ sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
 
     /* ---- Step 3: Create local NH for primary path ---- */
     {
-        /* Use first server IP for the local NH (it resolves via BVI/RIF;
-         * the actual dst IP doesn't matter for PROTECTION selection —
-         * MONITORED_OBJECT drives the primary↔standby switchover). */
-        std::string ip_str = server_ips[0].getIp().to_string();
+        /* For the primary local NH, we need any IP that resolves via the VLAN
+         * RIF.  If server IPs are configured, use the first one.  Otherwise
+         * use the VLAN SVI's own IP (always available). */
+        std::string ip_str;
+        if (!server_ips.empty())
+        {
+            ip_str = server_ips[0].getIp().to_string();
+        }
+        else
+        {
+            /* No static server IPs configured — defer PROTECTION NHG creation
+             * until the first server route is dynamically added via
+             * addHwFrrServerRoute() from neighorch.  Using the SVI's own IP
+             * (e.g. 10.0.0.1) would create a NH that resolves to self, causing
+             * arp-ipv4 glean instead of forwarding to the server. */
+            SWSS_LOG_NOTICE("HW FRR: no server IPs for %s, "
+                            "deferring PROTECTION NHG until first neighbor learn",
+                            es_port.c_str());
+            state.prot_nhg_oid = SAI_NULL_OBJECT_ID;
+            return SAI_STATUS_SUCCESS;
+        }
         IpAddress server_addr(ip_str);
         NextHopKey nh_key(server_addr, vlan_alias);
 
@@ -1738,6 +1777,412 @@ sai_status_t EvpnMhOrch::handleHwFrrLocalPortUp(const std::string &es_port)
         SWSS_LOG_NOTICE("HW FRR port up: %s route %s → PROTECTION NHG (0x%" PRIx64 ")",
                         es_port.c_str(), route.server_ip.to_string().c_str(),
                         state.prot_nhg_oid);
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+/*
+ * Find the ES port associated with a VLAN neighbor.  Checks all ES ports'
+ * VLAN membership to find which ES port is on this VLAN.
+ */
+std::string EvpnMhOrch::getEsPortForVlanNeighbor(const std::string &vlan_alias, const IpAddress &ip,
+                                                  const MacAddress &mac)
+{
+    /* First, try to find the ES port via the FDB: look up which PortChannel
+     * the neighbor's MAC is learned on. This is the correct mapping when
+     * multiple ES ports share the same VLAN (e.g. two PortChannels in Vlan10). */
+    if (gFdbOrch && mac)
+    {
+        Port vlan_port;
+        if (gPortsOrch->getPort(vlan_alias, vlan_port))
+        {
+            FdbEntry fdb_entry;
+            fdb_entry.mac = mac;
+            fdb_entry.bv_id = vlan_port.m_vlan_info.vlan_oid;
+            FdbData fdb_data;
+            if (gFdbOrch->getFdbEntry(fdb_entry, fdb_data))
+            {
+                /* Find which ES port owns this bridge_port_id */
+                for (const auto &es_entry : m_esIntfMap)
+                {
+                    Port es_port_obj;
+                    if (!gPortsOrch->getPort(es_entry.first, es_port_obj))
+                        continue;
+                    if (es_port_obj.m_bridge_port_id == fdb_data.bridge_port_id)
+                    {
+                        SWSS_LOG_NOTICE("getEsPortForVlanNeighbor: IP %s MAC %s → %s (via FDB)",
+                                        ip.to_string().c_str(), mac.to_string().c_str(),
+                                        es_entry.first.c_str());
+                        return es_entry.first;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Fallback: return the ES port only when there's exactly ONE ES port in
+     * the VLAN.  With multiple ES ports, the fallback would pick the first
+     * iterator entry which is essentially random — causing the NHG sharing
+     * bug where both server routes land on the same PROTECTION NHG.
+     *
+     * When ambiguous (multiple ES ports, FDB not yet learned locally),
+     * return empty string so the caller can defer until FDB resolves. */
+    std::string single_match;
+    int match_count = 0;
+    for (const auto &es_entry : m_esIntfMap)
+    {
+        const std::string &port_name = es_entry.first;
+
+        Port es_port_obj;
+        if (!gPortsOrch->getPort(port_name, es_port_obj))
+            continue;
+
+        vlan_members_t vlan_members;
+        gPortsOrch->getPortVlanMembers(es_port_obj, vlan_members);
+        for (const auto &member : vlan_members)
+        {
+            std::string member_vlan = std::string(VLAN_PREFIX) + std::to_string(member.first);
+            if (member_vlan == vlan_alias)
+            {
+                match_count++;
+                single_match = port_name;
+                break;
+            }
+        }
+    }
+
+    if (match_count == 1)
+    {
+        SWSS_LOG_NOTICE("getEsPortForVlanNeighbor: IP %s → %s (fallback, single ES port in VLAN)",
+                        ip.to_string().c_str(), single_match.c_str());
+        return single_match;
+    }
+
+    if (match_count > 1)
+    {
+        SWSS_LOG_NOTICE("getEsPortForVlanNeighbor: IP %s MAC %s → deferred (%d ES ports in %s, "
+                        "FDB not on local ES port yet)",
+                        ip.to_string().c_str(), mac.to_string().c_str(),
+                        match_count, vlan_alias.c_str());
+    }
+    return "";
+}
+
+void EvpnMhOrch::deferHwFrrRoute(const std::string &vlan_alias, const IpAddress &ip,
+                                  const MacAddress &mac)
+{
+    /* Only stash if we actually have HW FRR state (i.e. ES ports configured) */
+    if (m_hwFrrState.empty())
+        return;
+
+    /* Avoid duplicates */
+    for (const auto &p : m_pendingHwFrrRoutes)
+    {
+        if (p.server_ip == ip)
+            return;
+    }
+
+    SWSS_LOG_NOTICE("deferHwFrrRoute: stashing %s (MAC %s, VLAN %s) for retry on local FDB learn",
+                    ip.to_string().c_str(), mac.to_string().c_str(), vlan_alias.c_str());
+    m_pendingHwFrrRoutes.push_back({vlan_alias, ip, mac});
+}
+
+void EvpnMhOrch::retryPendingHwFrrRoutes(const std::string &es_port, const MacAddress &mac)
+{
+    if (m_pendingHwFrrRoutes.empty())
+        return;
+
+    /* Iterate pending routes and resolve any whose MAC matches */
+    auto it = m_pendingHwFrrRoutes.begin();
+    while (it != m_pendingHwFrrRoutes.end())
+    {
+        if (it->mac == mac)
+        {
+            SWSS_LOG_NOTICE("retryPendingHwFrrRoutes: resolving deferred route %s "
+                            "(MAC %s) → ES port %s",
+                            it->server_ip.to_string().c_str(),
+                            mac.to_string().c_str(), es_port.c_str());
+
+            auto mode = getEffectiveFailoverMode(es_port);
+            if (mode == EvpnMhFailoverMode::HW || mode == EvpnMhFailoverMode::L3)
+            {
+                addHwFrrServerRoute(es_port, it->server_ip);
+            }
+            it = m_pendingHwFrrRoutes.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+/*
+ * Dynamically add a /32 server route to an existing protection group.
+ * Called by neighorch when a new neighbor is learned on a VLAN interface
+ * associated with an ES port (L3/HW FRR mode).
+ */
+sai_status_t EvpnMhOrch::addHwFrrServerRoute(const std::string &es_port, const IpAddress &server_ip)
+{
+    SWSS_LOG_ENTER();
+
+    auto state_it = m_hwFrrState.find(es_port);
+    if (state_it == m_hwFrrState.end())
+    {
+        SWSS_LOG_NOTICE("addHwFrrServerRoute: no protection group for %s, skipping",
+                        es_port.c_str());
+        return SAI_STATUS_SUCCESS;
+    }
+
+    EsHwFrrState &state = state_it->second;
+
+    /* If PROTECTION NHG was deferred (no server IPs at creation time),
+     * now we have a real server IP — complete the protection group. */
+    if (state.prot_nhg_oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_NOTICE("addHwFrrServerRoute: completing deferred PROTECTION NHG for %s "
+                        "using server IP %s", es_port.c_str(), server_ip.to_string().c_str());
+
+        /* Find VLAN alias and RIF for this ES port */
+        Port es_port_obj;
+        if (!gPortsOrch->getPort(es_port, es_port_obj))
+        {
+            SWSS_LOG_ERROR("addHwFrrServerRoute: port %s not found", es_port.c_str());
+            return SAI_STATUS_FAILURE;
+        }
+
+        vlan_members_t vlan_members;
+        gPortsOrch->getPortVlanMembers(es_port_obj, vlan_members);
+        sai_object_id_t vlan_rif_oid = SAI_NULL_OBJECT_ID;
+        std::string vlan_alias;
+        for (const auto &member : vlan_members)
+        {
+            vlan_alias = std::string(VLAN_PREFIX) + std::to_string(member.first);
+            Port vlan;
+            if (gPortsOrch->getPort(vlan_alias, vlan) && vlan.m_rif_id != SAI_NULL_OBJECT_ID)
+            {
+                vlan_rif_oid = vlan.m_rif_id;
+                break;
+            }
+        }
+        if (vlan_rif_oid == SAI_NULL_OBJECT_ID)
+        {
+            SWSS_LOG_ERROR("addHwFrrServerRoute: no VLAN RIF for ES port %s", es_port.c_str());
+            return SAI_STATUS_FAILURE;
+        }
+
+        sai_object_id_t pc_oid = es_port_obj.m_lag_id;
+        if (pc_oid == SAI_NULL_OBJECT_ID)
+            pc_oid = es_port_obj.m_port_id;
+
+        /* Create local NH using this server IP */
+        NextHopKey nh_key(server_ip, vlan_alias);
+        if (gNeighOrch->hasNextHop(nh_key))
+        {
+            state.nh_local_oid = gNeighOrch->getNextHopId(nh_key);
+            state.owns_local_nh = false;
+        }
+        else
+        {
+            sai_ip_address_t sai_ip;
+            sai_ip.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+            inet_pton(AF_INET, server_ip.to_string().c_str(), &sai_ip.addr.ip4);
+
+            std::vector<sai_attribute_t> nh_attrs;
+            sai_attribute_t attr;
+            attr.id = SAI_NEXT_HOP_ATTR_TYPE;
+            attr.value.s32 = SAI_NEXT_HOP_TYPE_IP;
+            nh_attrs.push_back(attr);
+            attr.id = SAI_NEXT_HOP_ATTR_IP;
+            attr.value.ipaddr = sai_ip;
+            nh_attrs.push_back(attr);
+            attr.id = SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID;
+            attr.value.oid = vlan_rif_oid;
+            nh_attrs.push_back(attr);
+
+            sai_status_t status = sai_next_hop_api->create_next_hop(
+                &state.nh_local_oid, gSwitchId,
+                static_cast<uint32_t>(nh_attrs.size()), nh_attrs.data());
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("addHwFrrServerRoute: failed to create local NH (status=%d)", status);
+                return status;
+            }
+            state.owns_local_nh = true;
+        }
+
+        /* Create PROTECTION NHG */
+        {
+            sai_attribute_t nhg_attr;
+            nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+            nhg_attr.value.s32 = SAI_NEXT_HOP_GROUP_TYPE_PROTECTION;
+
+            sai_status_t status = sai_next_hop_group_api->create_next_hop_group(
+                &state.prot_nhg_oid, gSwitchId, 1, &nhg_attr);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("addHwFrrServerRoute: failed to create PROTECTION NHG (status=%d)", status);
+                return status;
+            }
+        }
+
+        /* PRIMARY member (local NH, MONITORED_OBJECT = PC) */
+        {
+            std::vector<sai_attribute_t> mbr_attrs;
+            sai_attribute_t attr;
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
+            attr.value.oid = state.prot_nhg_oid;
+            mbr_attrs.push_back(attr);
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+            attr.value.oid = state.nh_local_oid;
+            mbr_attrs.push_back(attr);
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_CONFIGURED_ROLE;
+            attr.value.s32 = SAI_NEXT_HOP_GROUP_MEMBER_CONFIGURED_ROLE_PRIMARY;
+            mbr_attrs.push_back(attr);
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_MONITORED_OBJECT;
+            attr.value.oid = pc_oid;
+            mbr_attrs.push_back(attr);
+
+            sai_status_t status = sai_next_hop_group_api->create_next_hop_group_member(
+                &state.primary_member_oid, gSwitchId,
+                static_cast<uint32_t>(mbr_attrs.size()), mbr_attrs.data());
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("addHwFrrServerRoute: failed to create PRIMARY member (status=%d)", status);
+                return status;
+            }
+        }
+
+        /* STANDBY member → standby ECMP NHG */
+        {
+            std::vector<sai_attribute_t> mbr_attrs;
+            sai_attribute_t attr;
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
+            attr.value.oid = state.prot_nhg_oid;
+            mbr_attrs.push_back(attr);
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+            attr.value.oid = state.standby_ecmp_nhg_oid;
+            mbr_attrs.push_back(attr);
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_CONFIGURED_ROLE;
+            attr.value.s32 = SAI_NEXT_HOP_GROUP_MEMBER_CONFIGURED_ROLE_STANDBY;
+            mbr_attrs.push_back(attr);
+
+            sai_status_t status = sai_next_hop_group_api->create_next_hop_group_member(
+                &state.standby_member_oid, gSwitchId,
+                static_cast<uint32_t>(mbr_attrs.size()), mbr_attrs.data());
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("addHwFrrServerRoute: failed to create STANDBY member (status=%d)", status);
+                return status;
+            }
+        }
+
+        SWSS_LOG_NOTICE("addHwFrrServerRoute: deferred PROTECTION NHG 0x%" PRIx64
+                        " completed for ES %s", state.prot_nhg_oid, es_port.c_str());
+    }
+
+    /* Check if route already exists */
+    for (const auto &route : state.server_routes)
+    {
+        if (route.server_ip.getIp() == server_ip)
+        {
+            SWSS_LOG_NOTICE("addHwFrrServerRoute: %s already has route for %s",
+                            es_port.c_str(), server_ip.to_string().c_str());
+            return SAI_STATUS_SUCCESS;
+        }
+    }
+
+    sai_object_id_t vrf_oid = getVrfOidForEsPort(es_port);
+    if (vrf_oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_ERROR("addHwFrrServerRoute: no VRF for ES port %s", es_port.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    /* Create /32 route → PROTECTION NHG */
+    IpPrefix server_prefix(server_ip.to_string() + "/32");
+
+    HwFrrServerRoute route;
+    route.server_ip = server_prefix;
+    route.nh_local_oid = SAI_NULL_OBJECT_ID;
+    route.owns_local_nh = false;
+    route.owns_route = false;
+
+    sai_route_entry_t route_entry;
+    route_entry.switch_id = gSwitchId;
+    route_entry.vr_id = vrf_oid;
+    route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+
+    std::string ip_str = server_ip.to_string();
+    inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
+    inet_pton(AF_INET, "255.255.255.255", &route_entry.destination.mask.ip4);
+
+    sai_attribute_t route_attr;
+    route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+    route_attr.value.oid = state.prot_nhg_oid;
+
+    sai_status_t status = sai_route_api->create_route_entry(
+        &route_entry, 1, &route_attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("addHwFrrServerRoute: failed to create route %s → PROTECTION NHG for %s (status=%d)",
+                       ip_str.c_str(), es_port.c_str(), status);
+        return status;
+    }
+
+    route.owns_route = true;
+    state.server_routes.push_back(route);
+
+    SWSS_LOG_NOTICE("addHwFrrServerRoute: %s → PROTECTION NHG 0x%" PRIx64 " for ES %s",
+                    ip_str.c_str(), state.prot_nhg_oid, es_port.c_str());
+    return SAI_STATUS_SUCCESS;
+}
+
+/*
+ * Remove a dynamically added /32 server route from a protection group.
+ */
+sai_status_t EvpnMhOrch::removeHwFrrServerRoute(const std::string &es_port, const IpAddress &server_ip)
+{
+    SWSS_LOG_ENTER();
+
+    auto state_it = m_hwFrrState.find(es_port);
+    if (state_it == m_hwFrrState.end())
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    EsHwFrrState &state = state_it->second;
+    sai_object_id_t vrf_oid = getVrfOidForEsPort(es_port);
+
+    for (auto it = state.server_routes.begin(); it != state.server_routes.end(); ++it)
+    {
+        if (it->server_ip.getIp() == server_ip && it->owns_route && vrf_oid != SAI_NULL_OBJECT_ID)
+        {
+            sai_route_entry_t route_entry;
+            route_entry.switch_id = gSwitchId;
+            route_entry.vr_id = vrf_oid;
+            route_entry.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+
+            std::string ip_str = server_ip.to_string();
+            inet_pton(AF_INET, ip_str.c_str(), &route_entry.destination.addr.ip4);
+            inet_pton(AF_INET, "255.255.255.255", &route_entry.destination.mask.ip4);
+
+            sai_status_t status = sai_route_api->remove_route_entry(&route_entry);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("removeHwFrrServerRoute: failed to remove route %s for %s (status=%d)",
+                               ip_str.c_str(), es_port.c_str(), status);
+            }
+            else
+            {
+                SWSS_LOG_NOTICE("removeHwFrrServerRoute: removed %s for ES %s",
+                                ip_str.c_str(), es_port.c_str());
+            }
+
+            state.server_routes.erase(it);
+            return status;
+        }
     }
 
     return SAI_STATUS_SUCCESS;

@@ -76,6 +76,26 @@ public:
     sai_status_t handleHwFrrLocalPortDown(const std::string &es_port);
     sai_status_t handleHwFrrLocalPortUp(const std::string &es_port);
 
+    /* Dynamic server route management for L3/HW FRR: called by neighorch
+     * when neighbors are learned/removed on VLAN interfaces associated with
+     * ES ports.  Adds/removes /32 routes via the PROTECTION NHG. */
+    sai_status_t addHwFrrServerRoute(const std::string &es_port, const IpAddress &server_ip);
+    sai_status_t removeHwFrrServerRoute(const std::string &es_port, const IpAddress &server_ip);
+
+    /* Find the ES port for a given VLAN + neighbor IP (for neighorch callback) */
+    std::string getEsPortForVlanNeighbor(const std::string &vlan_alias, const IpAddress &ip,
+                                         const MacAddress &mac = MacAddress());
+
+    /* Called by fdborch when a MAC is learned/moved to a local ES port.
+     * Drains any pending HW FRR routes that were deferred because
+     * getEsPortForVlanNeighbor couldn't resolve the ES port via FDB. */
+    void retryPendingHwFrrRoutes(const std::string &es_port, const MacAddress &mac);
+
+    /* Called by neighorch when getEsPortForVlanNeighbor returns empty.
+     * Stashes the route for later processing by retryPendingHwFrrRoutes. */
+    void deferHwFrrRoute(const std::string &vlan_alias, const IpAddress &ip,
+                         const MacAddress &mac);
+
     /* Check if the peer VTEP still has the ES active (via FRR zebra) */
     bool isPeerEsActive(const std::string &port_name);
 
@@ -165,6 +185,16 @@ private:
     };
 
     std::map<std::string, EsHwFrrState> m_hwFrrState;
+
+    /* Pending HW FRR routes: deferred because getEsPortForVlanNeighbor
+     * couldn't determine the correct ES port (FDB not yet on local port).
+     * Key: MAC address string. Drained by retryPendingHwFrrRoutes(). */
+    struct PendingHwFrrRoute {
+        std::string vlan_alias;
+        IpAddress   server_ip;
+        MacAddress  mac;
+    };
+    std::vector<PendingHwFrrRoute> m_pendingHwFrrRoutes;
 
     /* Whether peer state has been initialized */
     bool m_peerStateInitDone = false;
