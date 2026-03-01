@@ -1607,6 +1607,22 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
 
     m_syncdNeighbors[neighborEntry] = { macAddress, hw_config, 0, prefix_route };
 
+    /* EVPN MH: dynamically add /32 server route to protection NHG when a
+     * neighbor is learned on a VLAN interface associated with an ES port. */
+    if (gEvpnMhOrch && is_alias_vlan && !ip_address.isZero() &&
+        ip_address.getAddrScope() != IpAddress::LINK_SCOPE)
+    {
+        std::string es_port = gEvpnMhOrch->getEsPortForVlanNeighbor(alias, ip_address);
+        if (!es_port.empty())
+        {
+            auto mode = gEvpnMhOrch->getEffectiveFailoverMode(es_port);
+            if (mode == EvpnMhFailoverMode::HW || mode == EvpnMhFailoverMode::L3)
+            {
+                gEvpnMhOrch->addHwFrrServerRoute(es_port, ip_address);
+            }
+        }
+    }
+
     NeighborUpdate update = { neighborEntry, macAddress, true };
     notify(SUBJECT_TYPE_NEIGH_CHANGE, static_cast<void *>(&update));
 
@@ -1791,6 +1807,17 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
     }
 
     m_syncdNeighbors.erase(neighborEntry);
+
+    /* EVPN MH: remove /32 server route from protection NHG when neighbor is removed */
+    if (gEvpnMhOrch && !ip_address.isZero() &&
+        ip_address.getAddrScope() != IpAddress::LINK_SCOPE)
+    {
+        std::string es_port = gEvpnMhOrch->getEsPortForVlanNeighbor(alias, ip_address);
+        if (!es_port.empty())
+        {
+            gEvpnMhOrch->removeHwFrrServerRoute(es_port, ip_address);
+        }
+    }
 
     // TODO: added || isChassisDbInUse()) to Cisco PR
     if (gMySwitchType == "voq" || isChassisDbInUse())
