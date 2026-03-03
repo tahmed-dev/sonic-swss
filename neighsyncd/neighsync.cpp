@@ -123,6 +123,47 @@ void NeighSync::onMsg(int nlmsg_type, struct nl_object *obj)
 
     key+= LinkCache::getInstance().ifindexToName(rtnl_neigh_get_ifindex(neigh));
     intfName = key;
+
+    /*
+     * VPP BVI LCP tap → SONiC SVI translation for EVPN.
+     *
+     * VPP's LCP plugin creates a TAP interface named "bvivlan<N>" for
+     * each BVI.  Kernel neighbors learned on this TAP (e.g. from the
+     * clone-to-BVI ARP patch) must be processed by orchagent through the
+     * Vlan<N> RIF so that SAI can program:
+     *   - VPP arp-term (proxy ARP / ARP suppression)
+     *   - VPP L3 hairpin neighbor on bvi<N>
+     *   - Kernel neighbor on bvivlan<N> (for kernel-originated replies)
+     *   - Kernel neighbor on Vlan<N> (for FRR EVPN Type-2 MAC/IP)
+     *
+     * Orchagent has no RIF for "bvivlan<N>" — only for "Vlan<N>" — so
+     * we translate the interface name here.
+     *
+     * DEL events from bvivlan<N> are suppressed: the bvivlan<N> neighbor
+     * may go STALE/FAILED independently of the Vlan<N> neighbor (different
+     * interfaces, different NUD timers).  Propagating the DEL would
+     * incorrectly remove a still-valid Vlan<N> entry.  The Vlan<N>
+     * neighbor has its own lifecycle managed by FRR/kernel.
+     */
+    static const string bvivlan_prefix("bvivlan");
+    if (intfName.compare(0, bvivlan_prefix.size(), bvivlan_prefix) == 0)
+    {
+        string vlan_suffix = intfName.substr(bvivlan_prefix.size());
+        string mapped_name = "Vlan" + vlan_suffix;
+
+        if (nlmsg_type == RTM_DELNEIGH)
+        {
+            SWSS_LOG_INFO("Suppressing DEL from BVI tap %s (Vlan%s has own lifecycle)",
+                          intfName.c_str(), vlan_suffix.c_str());
+            return;
+        }
+
+        SWSS_LOG_INFO("Mapping BVI tap neighbor %s → %s",
+                       intfName.c_str(), mapped_name.c_str());
+        intfName = mapped_name;
+        key = mapped_name;
+    }
+
     key+= ":";
 
     /* Get the vrf name */
