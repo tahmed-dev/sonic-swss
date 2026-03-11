@@ -11,6 +11,14 @@
 #include "aclorch.h"
 #include "neighorch.h"
 #include "bulker.h"
+#include "subscriberstatetable.h"
+
+/* Node subtype for EVPN L3 Multi-Homing */
+enum class MuxNodeType
+{
+    DUAL_TOR,       /* Traditional IP-in-IP DualToR */
+    OCTANS_T1,      /* EVPN L3 MH with VxLAN tunnels */
+};
 
 enum MuxState
 {
@@ -132,7 +140,13 @@ public:
 class MuxCable
 {
 public:
+    /* DualToR constructor (single peer) */
     MuxCable(string name, IpPrefix& srv_ip4, IpPrefix& srv_ip6, IpAddress peer_ip, MuxCableType cable_type, MuxNbrHandlerType nbr_handler_type);
+
+    /* OctansT1 constructor (multi-peer VxLAN) */
+    MuxCable(string name, IpPrefix& srv_ip4, IpPrefix& srv_ip6,
+             std::vector<IpAddress> peer_vteps, sai_object_id_t vxlan_tunnel_id,
+             MuxNbrHandlerType nbr_handler_type);
 
     bool isActive() const
     {
@@ -182,6 +196,12 @@ private:
     IpPrefix srv_ip4_, srv_ip6_;
     IpAddress peer_ip4_;
 
+    /* OctansT1: multi-peer VxLAN support */
+    std::vector<IpAddress> peer_vteps_;
+    sai_object_id_t vxlan_tunnel_id_ = SAI_NULL_OBJECT_ID;
+    sai_object_id_t standby_nhg_id_ = SAI_NULL_OBJECT_ID;  /* ECMP NHG over tunnel NHs */
+    std::vector<sai_object_id_t> tunnel_nh_ids_;            /* Per-peer tunnel NHs */
+
     MuxOrch *mux_orch_;
     MuxCableOrch *mux_cb_orch_;
     MuxStateOrch *mux_state_orch_;
@@ -207,6 +227,27 @@ const request_description_t mux_cfg_request_description = {
             { }
 };
 
+/*
+ * Request description for EVPN_ETHERNET_SEGMENT table (OctansT1 mode).
+ * Key: PortChannel name.
+ * Fields read by muxorch: server_ipv4 (comma-separated /32 list),
+ *                         peer_vteps (comma-separated IP list),
+ *                         failover_mode ("l3" or "hw").
+ * Other ES fields (esi, sys_mac, df_pref) are handled by evpnmhorch.
+ */
+const request_description_t evpn_es_mux_request_description = {
+            { REQ_T_STRING },
+            {
+                { "server_ipv4", REQ_T_STRING },
+                { "peer_vteps", REQ_T_STRING },
+                { "failover_mode", REQ_T_STRING },
+                { "esi", REQ_T_STRING },
+                { "sys_mac", REQ_T_STRING },
+                { "df_pref", REQ_T_STRING },
+            },
+            { }
+};
+
 struct NHTunnel
 {
     sai_object_id_t nh_id;
@@ -225,11 +266,22 @@ public:
     MuxCfgRequest() : Request(mux_cfg_request_description, '|') { }
 };
 
+class EvpnEsMuxRequest : public Request
+{
+public:
+    EvpnEsMuxRequest() : Request(evpn_es_mux_request_description, '|') { }
+};
+
 
 class MuxOrch : public Orch2, public Observer, public Subject
 {
 public:
     MuxOrch(DBConnector *db, const std::vector<std::string> &tables, TunnelDecapOrch*, NeighOrch*, FdbOrch*);
+
+    /* OctansT1 constructor — takes ConfigDB for EVPN_ETHERNET_SEGMENT */
+    MuxOrch(DBConnector *configDb,
+            const std::vector<std::string> &tables,
+            NeighOrch* neighOrch, FdbOrch* fdbOrch);
 
     using handler_pair = pair<string, bool (MuxOrch::*) (const Request& )>;
     using handler_map = map<string, bool (MuxOrch::*) (const Request& )>;
@@ -238,6 +290,8 @@ public:
     {
         return mux_cable_tb_.find(portName) != std::end(mux_cable_tb_);
     }
+
+    MuxNodeType getNodeType() const { return node_type_; }
 
     MuxCable* getMuxCable(const std::string& portName)
     {
@@ -308,6 +362,9 @@ private:
     bool handleMuxCfg(const Request&);
     bool handlePeerSwitch(const Request&);
 
+    /* OctansT1: EVPN Ethernet Segment config handler */
+    bool handleEvpnEsCfg(const Request&);
+
     void updateNeighbor(const NeighborUpdate&);
     void updateFdb(const FdbUpdate&);
 
@@ -340,6 +397,8 @@ private:
     IpAddress mux_peer_switch_ = 0x0;
     sai_object_id_t mux_tunnel_id_ = SAI_NULL_OBJECT_ID;
 
+    MuxNodeType node_type_ = MuxNodeType::DUAL_TOR;
+
     MuxCableTb mux_cable_tb_;
     MuxTunnelNHs mux_tunnel_nh_;
     NextHopTb mux_nexthop_tb_;
@@ -351,6 +410,7 @@ private:
     FdbOrch *fdb_orch_;
 
     MuxCfgRequest request_;
+    EvpnEsMuxRequest evpn_es_request_;
     std::set<IpAddress> standalone_tunnel_neighbors_;
     std::map<IpAddress, std::string> skip_neighbors_;
 
@@ -386,14 +446,26 @@ public:
     void addTunnelRoute(const NextHopKey &nhKey);
     void removeTunnelRoute(const NextHopKey &nhKey);
 
+    /* OctansT1: start LACP state monitoring */
+    void startLacpStateMonitor(DBConnector *stateDb);
+
 private:
     virtual bool addOperation(const Request& request);
     virtual bool delOperation(const Request& request);
+
+    /* OctansT1: LACP state change handler */
+    void handleLacpStateChange(const std::string &portChannel,
+                               const std::string &member,
+                               const std::string &runnerState);
 
     unique_ptr<Table> mux_table_;
     MuxCableRequest request_;
     swss::Table mux_metric_table_;
     ProducerStateTable app_tunnel_route_table_;
+
+    /* OctansT1: LACP state subscriber */
+    std::unique_ptr<swss::SubscriberStateTable> lacp_state_sub_;
+    std::unique_ptr<DBConnector> state_db_;
 };
 
 const request_description_t mux_state_request_description = {

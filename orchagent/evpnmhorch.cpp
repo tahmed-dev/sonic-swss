@@ -13,6 +13,7 @@
 #include "vrforch.h"
 #include "fdborch.h"
 #include "schema.h"
+#include "dbconnector.h"
 
 extern FdbOrch *gFdbOrch;
 #include "dbconnector.h"
@@ -27,6 +28,8 @@ extern sai_vlan_api_t *sai_vlan_api;
 extern sai_next_hop_api_t *sai_next_hop_api;
 extern sai_next_hop_group_api_t *sai_next_hop_group_api;
 extern sai_route_api_t *sai_route_api;
+extern sai_neighbor_api_t *sai_neighbor_api;
+extern sai_router_interface_api_t *sai_router_intfs_api;
 extern sai_object_id_t gSwitchId;
 
 #define VLAN_PREFIX "Vlan"
@@ -348,6 +351,18 @@ void EvpnMhOrch::doEvpnEsIntfTask(Consumer &consumer)
                     m_esSysMac[key] = fvValue(i);
                     SWSS_LOG_NOTICE("EVPN MH: es_sys_mac for %s set to %s",
                         key.c_str(), fvValue(i).c_str());
+                }
+                else if (fvField(i) == "l3_vni")
+                {
+                    uint32_t vni = 0;
+                    try { vni = static_cast<uint32_t>(stoul(fvValue(i))); }
+                    catch (...) { vni = 0; }
+                    if (vni != 0)
+                    {
+                        m_esL3Vni[key] = vni;
+                        SWSS_LOG_NOTICE("EVPN MH: l3_vni for %s set to %u",
+                            key.c_str(), vni);
+                    }
                 }
             }
 
@@ -1121,6 +1136,52 @@ bool EvpnMhOrch::isPeerEsActive(const std::string &port_name)
 }
 
 /*
+ * Check if LACP is in "current" state for a PortChannel.
+ * Reads STATE_DB LAG_MEMBER_TABLE entries for any member of the LAG.
+ * Returns true if at least one member has runner.state=current and runner.selected=true.
+ * Returns true (default to local path) on any error.
+ */
+bool EvpnMhOrch::isLacpCurrent(const std::string &port_channel)
+{
+    try
+    {
+        swss::DBConnector stateDb("STATE_DB", 0);
+        /* Find member keys matching LAG_MEMBER_TABLE|<port_channel>|* */
+        std::string pattern = "LAG_MEMBER_TABLE|" + port_channel + "|*";
+        auto keys = stateDb.keys(pattern);
+
+        for (const auto &key : keys)
+        {
+            auto state = stateDb.hget(key, "runner.state");
+            auto selected = stateDb.hget(key, "runner.selected");
+            if (state && *state == "current" && selected && *selected == "true")
+            {
+                SWSS_LOG_NOTICE("isLacpCurrent: %s member %s is current+selected",
+                    port_channel.c_str(), key.c_str());
+                return true;
+            }
+        }
+
+        if (keys.empty())
+        {
+            SWSS_LOG_NOTICE("isLacpCurrent: no LAG_MEMBER_TABLE entries for %s, defaulting to true",
+                port_channel.c_str());
+            return true;
+        }
+
+        SWSS_LOG_NOTICE("isLacpCurrent: %s has %zu members but none current+selected",
+            port_channel.c_str(), keys.size());
+        return false;
+    }
+    catch (const std::exception &e)
+    {
+        SWSS_LOG_ERROR("isLacpCurrent: exception for %s: %s, defaulting to true",
+            port_channel.c_str(), e.what());
+        return true;
+    }
+}
+
+/*
  * HW FRR Protection Groups — Per-ES provisioning
  *
  * Each ES port gets ONE PROTECTION NHG:
@@ -1219,6 +1280,57 @@ sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
     state.es_port = es_port;
     state.peers.clear();
     state.server_routes.clear();
+
+    /* ---- Step 0: Ensure VRF→VNI encap mapper entry exists ---- */
+    /* Without this entry, the VPP SAI tunnel_encap_nexthop_action() cannot
+     * determine which VNI to use for VxLAN encap, and silently skips VPP
+     * tunnel creation — leaving the PROTECTION NHG standby path dead. */
+    {
+        EvpnNvoOrch* evpn_nvo_orch = gDirectory.get<EvpnNvoOrch*>();
+        VxlanTunnel* sip_tunnel = evpn_nvo_orch->getEVPNVtep();
+        if (sip_tunnel)
+        {
+            uint32_t l3vni = 0;
+            auto vni_it = m_esL3Vni.find(es_port);
+            if (vni_it != m_esL3Vni.end())
+            {
+                l3vni = vni_it->second;
+            }
+            if (l3vni != 0)
+            {
+                auto mapper_pair = sip_tunnel->getMapperEntry(l3vni);
+                if (mapper_pair.first == SAI_NULL_OBJECT_ID)
+                {
+                    /* Create VRF→VNI encap mapper entry */
+                    sai_object_id_t encap_entry = sip_tunnel->addEncapMapperEntry(
+                        vrf_oid, l3vni, TUNNEL_MAP_T_VIRTUAL_ROUTER);
+                    if (encap_entry != SAI_NULL_OBJECT_ID)
+                    {
+                        /* Also store in tunnel's mapper cache so it's not created twice */
+                        sip_tunnel->insertMapperEntry(encap_entry, mapper_pair.second, l3vni);
+                        SWSS_LOG_NOTICE("HW FRR: created VRF→VNI encap mapper entry: "
+                                        "VRF 0x%" PRIx64 " → VNI %u (entry 0x%" PRIx64 ")",
+                                        vrf_oid, l3vni, encap_entry);
+                    }
+                    else
+                    {
+                        SWSS_LOG_ERROR("HW FRR: failed to create VRF→VNI encap mapper entry "
+                                       "for VRF 0x%" PRIx64 " VNI %u", vrf_oid, l3vni);
+                    }
+                }
+                else
+                {
+                    SWSS_LOG_NOTICE("HW FRR: VRF→VNI encap mapper entry already exists "
+                                    "for VNI %u (entry 0x%" PRIx64 ")", l3vni, mapper_pair.first);
+                }
+            }
+            else
+            {
+                SWSS_LOG_WARN("HW FRR: no L3 VNI configured for ES port %s, "
+                              "tunnel encap may not work", es_port.c_str());
+            }
+        }
+    }
 
     /* ---- Step 1: Create tunnel NHs for each peer VTEP ---- */
     for (size_t i = 0; i < peer_ips.size(); i++)
@@ -1450,7 +1562,11 @@ sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
                     state.standby_member_oid, state.standby_ecmp_nhg_oid,
                     state.peers.size());
 
-    /* ---- Step 5: Create /32 routes for all server IPs → same PROTECTION NHG ---- */
+    /* ---- Step 5: Create /32 routes for all server IPs ---- */
+    /* If LACP is current (local server), route → PROTECTION NHG (primary=local, standby=tunnel).
+     * If LACP is defaulted (remote server), route → direct tunnel NH (no local path). */
+    bool lacp_current = isLacpCurrent(es_port);
+
     for (const auto &server_ip : server_ips)
     {
         HwFrrServerRoute route;
@@ -1458,6 +1574,7 @@ sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
         route.nh_local_oid = SAI_NULL_OBJECT_ID;  // Not per-server anymore
         route.owns_local_nh = false;
         route.owns_route = false;
+        route.uses_protection = lacp_current;
 
         sai_route_entry_t route_entry;
         route_entry.switch_id = gSwitchId;
@@ -1472,7 +1589,21 @@ sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
 
         sai_attribute_t route_attr;
         route_attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
-        route_attr.value.oid = state.prot_nhg_oid;
+
+        if (lacp_current)
+        {
+            route_attr.value.oid = state.prot_nhg_oid;
+            SWSS_LOG_NOTICE("HW FRR: LACP current on %s — route %s → PROTECTION NHG 0x%" PRIx64,
+                            es_port.c_str(), server_ip.to_string().c_str(), state.prot_nhg_oid);
+        }
+        else
+        {
+            /* LACP defaulted — server is remote, route directly via tunnel */
+            route_attr.value.oid = state.peers[0].nh_tunnel_oid;
+            SWSS_LOG_NOTICE("HW FRR: LACP defaulted on %s — route %s → tunnel NH 0x%" PRIx64,
+                            es_port.c_str(), server_ip.to_string().c_str(),
+                            state.peers[0].nh_tunnel_oid);
+        }
 
         sai_status_t status = sai_route_api->create_route_entry(
             &route_entry, 1, &route_attr);
@@ -1487,8 +1618,85 @@ sai_status_t EvpnMhOrch::createHwFrrProtectionGroups(const std::string &es_port)
         route.owns_route = true;
         state.server_routes.push_back(route);
 
-        SWSS_LOG_NOTICE("HW FRR: route %s → PROTECTION NHG 0x%" PRIx64,
-                        server_ip.to_string().c_str(), state.prot_nhg_oid);
+        SWSS_LOG_NOTICE("HW FRR: route %s → %s 0x%" PRIx64,
+                        server_ip.to_string().c_str(),
+                        lacp_current ? "PROTECTION NHG" : "tunnel NH",
+                        route_attr.value.oid);
+
+        /* ---- ARP termination entry for this server IP ----
+         *
+         * Create a SAI neighbor on the overlay VLAN RIF (e.g. Vlan10) with
+         * the anycast gateway MAC.  This triggers:
+         *   (1) VPP BD arp-term entry — VPP responds to ARP for this IP
+         *   (2) Static VPP neighbor with real MAC (for L3 hairpin)
+         *   (3) Kernel neighbor on bvivlan<N> and Vlan<N> (for FRR Type-2)
+         *
+         * Without this, remote server IPs are unreachable: ARP from local
+         * servers into the BD gets intercepted by arp-term which has no
+         * entry → ARP fails → "Destination Host Unreachable".
+         *
+         * The NO_HOST_ROUTE flag is set to suppress the /32 FIB entry
+         * (our PROTECTION NHG route owns the /32 exclusively).
+         *
+         * Note: the real server MAC is unknown at this point — we use
+         * the anycast GW MAC.  The SAI code detects same_mac and programs
+         * only the arp-term entry (no L3 hairpin neighbor).  The real MAC
+         * will be learned dynamically via clone-to-BVI when the server
+         * actually sends ARP.
+         */
+        if (vlan_rif_oid != SAI_NULL_OBJECT_ID)
+        {
+            sai_neighbor_entry_t nbr_entry;
+            nbr_entry.switch_id = gSwitchId;
+            nbr_entry.rif_id = vlan_rif_oid;
+            nbr_entry.ip_address.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+            inet_pton(AF_INET, ip_str.c_str(), &nbr_entry.ip_address.addr.ip4);
+
+            /* Get the anycast GW MAC from the overlay VLAN RIF */
+            sai_attribute_t rif_attr;
+            rif_attr.id = SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS;
+            sai_mac_t gw_mac = {};
+            bool have_gw_mac = false;
+            if (sai_router_intfs_api->get_router_interface_attribute(
+                    vlan_rif_oid, 1, &rif_attr) == SAI_STATUS_SUCCESS)
+            {
+                memcpy(gw_mac, rif_attr.value.mac, sizeof(sai_mac_t));
+                /* Verify not all zeros */
+                for (int m = 0; m < 6; m++) {
+                    if (gw_mac[m] != 0) { have_gw_mac = true; break; }
+                }
+            }
+
+            if (have_gw_mac)
+            {
+                std::vector<sai_attribute_t> nbr_attrs;
+                sai_attribute_t nattr;
+                nattr.id = SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS;
+                memcpy(nattr.value.mac, gw_mac, sizeof(sai_mac_t));
+                nbr_attrs.push_back(nattr);
+                nattr.id = SAI_NEIGHBOR_ENTRY_ATTR_NO_HOST_ROUTE;
+                nattr.value.booldata = true;
+                nbr_attrs.push_back(nattr);
+
+                sai_status_t nbr_status = sai_neighbor_api->create_neighbor_entry(
+                    &nbr_entry,
+                    static_cast<uint32_t>(nbr_attrs.size()),
+                    nbr_attrs.data());
+
+                if (nbr_status == SAI_STATUS_SUCCESS ||
+                    nbr_status == SAI_STATUS_ITEM_ALREADY_EXISTS)
+                {
+                    SWSS_LOG_NOTICE("HW FRR: created ARP-term neighbor for %s on "
+                                    "overlay VLAN RIF 0x%" PRIx64,
+                                    ip_str.c_str(), vlan_rif_oid);
+                }
+                else
+                {
+                    SWSS_LOG_WARN("HW FRR: failed to create ARP-term neighbor for %s "
+                                  "(status=%d)", ip_str.c_str(), nbr_status);
+                }
+            }
+        }
     }
 
     SWSS_LOG_NOTICE("HW FRR: ES port %s fully provisioned: %zu peers, "

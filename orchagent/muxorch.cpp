@@ -1,6 +1,7 @@
 #include <cassert>
 #include <string>
 #include <vector>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <stdexcept>
@@ -25,6 +26,7 @@
 #include "fdborch.h"
 #include "qosorch.h"
 #include "warm_restart.h"
+#include "vxlanorch.h"
 
 /* Global variables */
 extern Directory<Orch*> gDirectory;
@@ -39,6 +41,8 @@ extern QosOrch *gQosOrch;
 extern sai_object_id_t gVirtualRouterId;
 extern sai_object_id_t  gUnderlayIfId;
 extern sai_object_id_t gSwitchId;
+extern string gMySwitchSubType;
+extern sai_next_hop_group_api_t* sai_next_hop_group_api;
 extern sai_route_api_t* sai_route_api;
 extern sai_tunnel_api_t* sai_tunnel_api;
 extern sai_next_hop_api_t* sai_next_hop_api;
@@ -448,6 +452,105 @@ MuxCable::MuxCable(string name, IpPrefix& srv_ip4, IpPrefix& srv_ip6, IpAddress 
     }
 }
 
+/*
+ * OctansT1 constructor: Multi-peer VxLAN-based MuxCable.
+ * Creates tunnel NHs for each peer VTEP and an ECMP NHG over them.
+ * Initial state is determined by LACP state (set externally after construction).
+ */
+MuxCable::MuxCable(string name, IpPrefix& srv_ip4, IpPrefix& srv_ip6,
+                   std::vector<IpAddress> peer_vteps, sai_object_id_t vxlan_tunnel_id,
+                   MuxNbrHandlerType nbr_handler_type)
+         :mux_name_(name), srv_ip4_(srv_ip4), srv_ip6_(srv_ip6),
+          peer_ip4_(peer_vteps.empty() ? IpAddress() : peer_vteps[0]),
+          cable_type_(MuxCableType::ACTIVE_STANDBY),
+          nbr_handler_type_(nbr_handler_type),
+          peer_vteps_(std::move(peer_vteps)),
+          vxlan_tunnel_id_(vxlan_tunnel_id)
+{
+    mux_orch_ = gDirectory.get<MuxOrch*>();
+    mux_cb_orch_ = gDirectory.get<MuxCableOrch*>();
+    mux_state_orch_ = gDirectory.get<MuxStateOrch*>();
+
+    SWSS_LOG_NOTICE("Creating OctansT1 MuxCable for %s with %zu peer VTEPs, tunnel 0x%" PRIx64,
+                    name.c_str(), peer_vteps_.size(), vxlan_tunnel_id_);
+
+    nbr_handler_ = std::make_unique<MuxNbrHandler>();
+
+    /* Create tunnel NHs for each peer VTEP */
+    for (auto &vtep : peer_vteps_)
+    {
+        sai_object_id_t nh_id = mux_orch_->createNextHopTunnel(MUX_TUNNEL, vtep);
+        if (nh_id == SAI_NULL_OBJECT_ID)
+        {
+            SWSS_LOG_ERROR("OctansT1: failed to create tunnel NH for peer %s",
+                           vtep.to_string().c_str());
+            continue;
+        }
+        tunnel_nh_ids_.push_back(nh_id);
+        SWSS_LOG_NOTICE("OctansT1: created tunnel NH 0x%" PRIx64 " for peer %s",
+                        nh_id, vtep.to_string().c_str());
+    }
+
+    /* Create ECMP NHG over tunnel NHs if we have multiple peers,
+     * or use single NH directly */
+    if (tunnel_nh_ids_.size() > 1)
+    {
+        std::vector<sai_attribute_t> nhg_attrs;
+        sai_attribute_t attr;
+
+        attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+        attr.value.s32 = SAI_NEXT_HOP_GROUP_TYPE_ECMP;
+        nhg_attrs.push_back(attr);
+
+        sai_status_t status = sai_next_hop_group_api->create_next_hop_group(
+            &standby_nhg_id_, gSwitchId,
+            static_cast<uint32_t>(nhg_attrs.size()), nhg_attrs.data());
+
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("OctansT1: failed to create ECMP NHG for %s (status=%d)",
+                           name.c_str(), status);
+        }
+        else
+        {
+            /* Add members */
+            for (auto nh_id : tunnel_nh_ids_)
+            {
+                sai_object_id_t member_id;
+                std::vector<sai_attribute_t> member_attrs;
+
+                attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
+                attr.value.oid = standby_nhg_id_;
+                member_attrs.push_back(attr);
+
+                attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+                attr.value.oid = nh_id;
+                member_attrs.push_back(attr);
+
+                status = sai_next_hop_group_api->create_next_hop_group_member(
+                    &member_id, gSwitchId,
+                    static_cast<uint32_t>(member_attrs.size()), member_attrs.data());
+
+                if (status != SAI_STATUS_SUCCESS)
+                {
+                    SWSS_LOG_ERROR("OctansT1: failed to add NH 0x%" PRIx64 " to NHG (status=%d)",
+                                   nh_id, status);
+                }
+            }
+            SWSS_LOG_NOTICE("OctansT1: created ECMP NHG 0x%" PRIx64 " with %zu members for %s",
+                            standby_nhg_id_, tunnel_nh_ids_.size(), name.c_str());
+        }
+    }
+
+    state_machine_handlers_.insert(handler_pair(MUX_STATE_INIT_ACTIVE, &MuxCable::stateInitActive));
+    state_machine_handlers_.insert(handler_pair(MUX_STATE_STANDBY_ACTIVE, &MuxCable::stateActive));
+    state_machine_handlers_.insert(handler_pair(MUX_STATE_INIT_STANDBY, &MuxCable::stateStandby));
+    state_machine_handlers_.insert(handler_pair(MUX_STATE_ACTIVE_STANDBY, &MuxCable::stateStandby));
+
+    /* OctansT1: Start in INIT — LACP state monitor will set actual state */
+    state_ = MuxState::MUX_STATE_INIT;
+}
+
 bool MuxCable::stateInitActive()
 {
     SWSS_LOG_INFO("Set state to Active from %s", muxStateValToString.at(state_).c_str());
@@ -471,10 +574,14 @@ bool MuxCable::stateActive()
         return false;
     }
 
-    if (!aclHandler(port.m_port_id, mux_name_, false))
+    /* OctansT1: skip ACL — no drop rules needed */
+    if (mux_orch_->getNodeType() != MuxNodeType::OCTANS_T1)
     {
-        SWSS_LOG_INFO("Remove ACL drop rule failed for %s", mux_name_.c_str());
-        return false;
+        if (!aclHandler(port.m_port_id, mux_name_, false))
+        {
+            SWSS_LOG_INFO("Remove ACL drop rule failed for %s", mux_name_.c_str());
+            return false;
+        }
     }
 
     if (!nbrHandler(true))
@@ -501,10 +608,14 @@ bool MuxCable::stateStandby()
         return false;
     }
 
-    if (!aclHandler(port.m_port_id, mux_name_))
+    /* OctansT1: skip ACL — no drop rules needed */
+    if (mux_orch_->getNodeType() != MuxNodeType::OCTANS_T1)
     {
-        SWSS_LOG_INFO("Add ACL drop rule failed for %s", mux_name_.c_str());
-        return false;
+        if (!aclHandler(port.m_port_id, mux_name_))
+        {
+            SWSS_LOG_INFO("Add ACL drop rule failed for %s", mux_name_.c_str());
+            return false;
+        }
     }
 
     return true;
@@ -664,7 +775,25 @@ bool MuxCable::nbrHandler(bool enable, bool update_rt)
     }
     else
     {
-        sai_object_id_t tnh = mux_orch_->createNextHopTunnel(MUX_TUNNEL, peer_ip4_);
+        sai_object_id_t tnh = SAI_NULL_OBJECT_ID;
+
+        if (mux_orch_->getNodeType() == MuxNodeType::OCTANS_T1)
+        {
+            /* OctansT1: use pre-created ECMP NHG or single tunnel NH */
+            if (standby_nhg_id_ != SAI_NULL_OBJECT_ID)
+            {
+                tnh = standby_nhg_id_;
+            }
+            else if (!tunnel_nh_ids_.empty())
+            {
+                tnh = tunnel_nh_ids_[0];
+            }
+        }
+        else
+        {
+            tnh = mux_orch_->createNextHopTunnel(MUX_TUNNEL, peer_ip4_);
+        }
+
         if (tnh == SAI_NULL_OBJECT_ID)
         {
             SWSS_LOG_INFO("Null NH object id, retry for %s", peer_ip4_.to_string().c_str());
@@ -2198,6 +2327,32 @@ MuxOrch::MuxOrch(DBConnector *db, const std::vector<std::string> &tables,
     state_mux_cable_table_ = std::make_unique<Table>(state_db.get(), STATE_MUX_CABLE_TABLE_NAME);
 }
 
+/*
+ * OctansT1 constructor: MuxOrch driven by EVPN_ETHERNET_SEGMENT config
+ * and LACP state rather than CFG_MUX_CABLE + CFG_PEER_SWITCH.
+ */
+MuxOrch::MuxOrch(DBConnector *configDb,
+                 const std::vector<std::string> &tables,
+                 NeighOrch* neighOrch, FdbOrch* fdbOrch) :
+         Orch2(configDb, tables, evpn_es_request_),
+         decap_orch_(nullptr),
+         neigh_orch_(neighOrch),
+         fdb_orch_(fdbOrch),
+         node_type_(MuxNodeType::OCTANS_T1)
+{
+    handler_map_.insert(handler_pair("EVPN_ETHERNET_SEGMENT", &MuxOrch::handleEvpnEsCfg));
+
+    prefix_nbrs_supported_ = neighOrch->isNoHostRouteSupported();
+    SWSS_LOG_NOTICE("MuxOrch (OctansT1): initialized, prefix_nbrs_supported_ = %s",
+                    prefix_nbrs_supported_ ? "true" : "false");
+
+    neigh_orch_->attach(this);
+    fdb_orch_->attach(this);
+
+    std::unique_ptr<DBConnector> state_db_local = std::make_unique<DBConnector>("STATE_DB", 0);
+    state_mux_cable_table_ = std::make_unique<Table>(state_db_local.get(), STATE_MUX_CABLE_TABLE_NAME);
+}
+
 bool MuxOrch::handleMuxCfg(const Request& request)
 {
     SWSS_LOG_ENTER();
@@ -2327,6 +2482,200 @@ bool MuxOrch::handleMuxCfg(const Request& request)
         mux_cable_tb_.erase(port_name);
 
         SWSS_LOG_NOTICE("Mux cable for port '%s' was removed", port_name.c_str());
+    }
+
+    return true;
+}
+
+/*
+ * OctansT1: Handle EVPN_ETHERNET_SEGMENT config entries.
+ * For each PortChannel with failover_mode=l3 and server_ipv4 + peer_vteps,
+ * create a VxLAN-based MuxCable.
+ *
+ * Key: PortChannel name
+ * Fields: server_ipv4 (comma-separated /32 list),
+ *         peer_vteps (comma-separated VTEPs),
+ *         failover_mode ("l3" or "hw")
+ */
+bool MuxOrch::handleEvpnEsCfg(const Request& request)
+{
+    SWSS_LOG_ENTER();
+
+    const auto& port_name = request.getKeyString(0);
+    auto op = request.getOperation();
+
+    SWSS_LOG_NOTICE("OctansT1: handleEvpnEsCfg %s op=%s", port_name.c_str(), op.c_str());
+
+    if (op == SET_COMMAND)
+    {
+        /* Parse failover_mode — only process if "l3" or "hw" */
+        string failover_mode;
+        for (const auto &name : request.getAttrFieldNames())
+        {
+            if (name == "failover_mode")
+            {
+                failover_mode = request.getAttrString("failover_mode");
+            }
+        }
+
+        if (failover_mode != "l3" && failover_mode != "hw")
+        {
+            SWSS_LOG_INFO("OctansT1: ignoring ES %s — failover_mode '%s' is not l3/hw",
+                          port_name.c_str(), failover_mode.c_str());
+            return true;
+        }
+
+        /* Parse server_ipv4 list */
+        string server_ipv4_str;
+        for (const auto &name : request.getAttrFieldNames())
+        {
+            if (name == "server_ipv4")
+            {
+                server_ipv4_str = request.getAttrString("server_ipv4");
+            }
+        }
+
+        if (server_ipv4_str.empty())
+        {
+            SWSS_LOG_INFO("OctansT1: ES %s has no server_ipv4, skipping mux creation",
+                          port_name.c_str());
+            return true;
+        }
+
+        /* Parse peer_vteps list */
+        string peer_vteps_str;
+        for (const auto &name : request.getAttrFieldNames())
+        {
+            if (name == "peer_vteps")
+            {
+                peer_vteps_str = request.getAttrString("peer_vteps");
+            }
+        }
+
+        if (peer_vteps_str.empty())
+        {
+            SWSS_LOG_INFO("OctansT1: ES %s has no peer_vteps, skipping mux creation",
+                          port_name.c_str());
+            return true;
+        }
+
+        /* Get VxLAN tunnel from vxlanorch */
+        VxlanTunnelOrch *vxlan_orch = gDirectory.get<VxlanTunnelOrch*>();
+        sai_object_id_t vxlan_tunnel_id = SAI_NULL_OBJECT_ID;
+
+        /* Look for any configured VxLAN tunnel (typically "vtep1") */
+        /* TODO: make tunnel name configurable or auto-discover */
+        try
+        {
+            auto *tunnel = vxlan_orch->getVxlanTunnel("vtep1");
+            if (tunnel)
+            {
+                vxlan_tunnel_id = tunnel->getTunnelId();
+            }
+        }
+        catch (const std::exception &e)
+        {
+            SWSS_LOG_INFO("OctansT1: VxLAN tunnel 'vtep1' not ready yet for ES %s, will retry",
+                          port_name.c_str());
+            return false;  /* Retry — Orch2 will re-process on next event */
+        }
+
+        if (vxlan_tunnel_id == SAI_NULL_OBJECT_ID)
+        {
+            SWSS_LOG_INFO("OctansT1: VxLAN tunnel not ready for ES %s, will retry",
+                          port_name.c_str());
+            return false;
+        }
+
+        SWSS_LOG_NOTICE("OctansT1: ES %s using VxLAN tunnel 0x%" PRIx64,
+                        port_name.c_str(), vxlan_tunnel_id);
+
+        /* Set the class-level tunnel ID so createNextHopTunnel() works */
+        if (mux_tunnel_id_ == SAI_NULL_OBJECT_ID)
+        {
+            mux_tunnel_id_ = vxlan_tunnel_id;
+            SWSS_LOG_NOTICE("OctansT1: set mux_tunnel_id_ = 0x%" PRIx64, mux_tunnel_id_);
+        }
+
+        /* Parse comma-separated peer_vteps into vector */
+        std::vector<IpAddress> peer_vteps;
+        std::stringstream vtep_ss(peer_vteps_str);
+        string vtep_token;
+        while (std::getline(vtep_ss, vtep_token, ','))
+        {
+            /* Trim whitespace */
+            vtep_token.erase(0, vtep_token.find_first_not_of(" \t"));
+            vtep_token.erase(vtep_token.find_last_not_of(" \t") + 1);
+            if (!vtep_token.empty())
+            {
+                try
+                {
+                    peer_vteps.push_back(IpAddress(vtep_token));
+                    SWSS_LOG_NOTICE("OctansT1: ES %s peer VTEP: %s",
+                                    port_name.c_str(), vtep_token.c_str());
+                }
+                catch (const std::exception &e)
+                {
+                    SWSS_LOG_ERROR("OctansT1: invalid peer_vtep '%s' for ES %s",
+                                   vtep_token.c_str(), port_name.c_str());
+                }
+            }
+        }
+
+        if (peer_vteps.empty())
+        {
+            SWSS_LOG_ERROR("OctansT1: ES %s has no valid peer_vteps", port_name.c_str());
+            return true;
+        }
+
+        /* Parse comma-separated server_ipv4 and create MuxCable per server IP */
+        std::stringstream srv_ss(server_ipv4_str);
+        string srv_token;
+        while (std::getline(srv_ss, srv_token, ','))
+        {
+            srv_token.erase(0, srv_token.find_first_not_of(" \t"));
+            srv_token.erase(srv_token.find_last_not_of(" \t") + 1);
+            if (srv_token.empty()) continue;
+
+            try
+            {
+                IpPrefix srv_ip(srv_token);
+                IpPrefix srv_ip6;  /* No IPv6 for now */
+
+                /* Use PortChannel name + server IP as mux key for uniqueness */
+                string mux_key = port_name;
+
+                if (isMuxExists(mux_key))
+                {
+                    SWSS_LOG_NOTICE("OctansT1: MuxCable already exists for %s, updating",
+                                    mux_key.c_str());
+                    /* TODO: handle update (peer VTEP changes, etc.) */
+                    continue;
+                }
+
+                mux_cable_tb_[mux_key] = std::make_unique<MuxCable>(
+                    mux_key, srv_ip, srv_ip6,
+                    peer_vteps, vxlan_tunnel_id,
+                    MuxNbrHandlerType::NBR_HANDLER_HOST_ROUTE);
+
+                SWSS_LOG_NOTICE("OctansT1: created MuxCable for %s, server %s, %zu peers",
+                                mux_key.c_str(), srv_token.c_str(), peer_vteps.size());
+            }
+            catch (const std::exception &e)
+            {
+                SWSS_LOG_ERROR("OctansT1: failed to create MuxCable for ES %s server '%s': %s",
+                               port_name.c_str(), srv_token.c_str(), e.what());
+            }
+        }
+    }
+    else
+    {
+        /* DEL operation — remove MuxCable */
+        if (isMuxExists(port_name))
+        {
+            mux_cable_tb_.erase(port_name);
+            SWSS_LOG_NOTICE("OctansT1: removed MuxCable for %s", port_name.c_str());
+        }
     }
 
     return true;
@@ -2625,6 +2974,131 @@ bool MuxCableOrch::delOperation(const Request& request)
     SWSS_LOG_NOTICE("Deleting Mux state entry for port %s not implemented", port_name.c_str());
 
     return true;
+}
+
+/*
+ * OctansT1: Start monitoring STATE_DB LAG_MEMBER_TABLE for LACP state changes.
+ * teamd writes runner.state = "current" or "defaulted" per LAG member.
+ * We translate this to mux active/standby for the parent PortChannel.
+ *
+ * Called from orchdaemon after MuxOrch and MuxCableOrch are constructed.
+ */
+void MuxCableOrch::startLacpStateMonitor(DBConnector *stateDb)
+{
+    SWSS_LOG_NOTICE("OctansT1: Starting LACP state monitor on LAG_MEMBER_TABLE");
+
+    state_db_ = std::make_unique<DBConnector>("STATE_DB", 0);
+
+    /* Read initial LACP state for all LAG members */
+    Table lag_member_table(state_db_.get(), "LAG_MEMBER_TABLE");
+    std::vector<std::string> keys;
+    lag_member_table.getKeys(keys);
+
+    for (const auto &key : keys)
+    {
+        /* Key format: PortChannelX:EthernetY */
+        auto delim = key.find(':');
+        if (delim == string::npos) continue;
+
+        string port_channel = key.substr(0, delim);
+        string member = key.substr(delim + 1);
+
+        std::vector<FieldValueTuple> fvs;
+        if (!lag_member_table.get(key, fvs)) continue;
+
+        for (const auto &fv : fvs)
+        {
+            if (fvField(fv) == "runner.state")
+            {
+                handleLacpStateChange(port_channel, member, fvValue(fv));
+            }
+        }
+    }
+}
+
+/*
+ * OctansT1: Handle LACP state change for a LAG member.
+ * If ANY member of a PortChannel has runner.state=current, the PC is ACTIVE.
+ * If ALL members are defaulted (or no members), the PC is STANDBY.
+ */
+void MuxCableOrch::handleLacpStateChange(const std::string &portChannel,
+                                          const std::string &member,
+                                          const std::string &runnerState)
+{
+    MuxOrch* mux_orch = gDirectory.get<MuxOrch*>();
+
+    if (!mux_orch->isMuxExists(portChannel))
+    {
+        return;  /* Not a mux-managed PortChannel */
+    }
+
+    /* Determine aggregate LACP state for the PortChannel.
+     * "current" on any member → active. All "defaulted" → standby. */
+    string new_mux_state;
+    if (runnerState == "current")
+    {
+        new_mux_state = "active";
+    }
+    else if (runnerState == "defaulted")
+    {
+        /* Check if any other member is still current */
+        Table lag_member_table(state_db_.get(), "LAG_MEMBER_TABLE");
+        std::vector<std::string> keys;
+        lag_member_table.getKeys(keys);
+
+        bool any_current = false;
+        for (const auto &key : keys)
+        {
+            if (key.substr(0, key.find(':')) != portChannel) continue;
+            if (key.substr(key.find(':') + 1) == member) continue;  /* Skip self */
+
+            std::vector<FieldValueTuple> fvs;
+            if (!lag_member_table.get(key, fvs)) continue;
+
+            for (const auto &fv : fvs)
+            {
+                if (fvField(fv) == "runner.state" && fvValue(fv) == "current")
+                {
+                    any_current = true;
+                    break;
+                }
+            }
+            if (any_current) break;
+        }
+
+        new_mux_state = any_current ? "active" : "standby";
+    }
+    else
+    {
+        SWSS_LOG_INFO("OctansT1: unknown runner.state '%s' for %s:%s",
+                      runnerState.c_str(), portChannel.c_str(), member.c_str());
+        return;
+    }
+
+    auto mux_obj = mux_orch->getMuxCable(portChannel);
+    string current_state = mux_obj->getState();
+
+    if (current_state == new_mux_state)
+    {
+        SWSS_LOG_INFO("OctansT1: %s already in state %s, no change",
+                      portChannel.c_str(), new_mux_state.c_str());
+        return;
+    }
+
+    SWSS_LOG_NOTICE("OctansT1: LACP state change %s:%s runner.state=%s → mux %s (was %s)",
+                    portChannel.c_str(), member.c_str(), runnerState.c_str(),
+                    new_mux_state.c_str(), current_state.c_str());
+
+    try
+    {
+        mux_obj->setState(new_mux_state);
+    }
+    catch (const std::exception &e)
+    {
+        SWSS_LOG_ERROR("OctansT1: failed to set state %s for %s: %s",
+                       new_mux_state.c_str(), portChannel.c_str(), e.what());
+        mux_obj->rollbackStateChange();
+    }
 }
 
 MuxStateOrch::MuxStateOrch(DBConnector *db, const std::string& tableName) :

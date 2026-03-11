@@ -465,11 +465,28 @@ bool OrchDaemon::init()
         CFG_MUX_CABLE_TABLE_NAME,
         CFG_PEER_SWITCH_TABLE_NAME
     };
-    gMuxOrch = new MuxOrch(m_configDb, mux_tables, gTunneldecapOrch, gNeighOrch, gFdbOrch);
+    if (gMySwitchSubType == "OctansT1")
+    {
+        /* OctansT1: Use EVPN_ETHERNET_SEGMENT as mux config source */
+        vector<string> octans_mux_tables = { "EVPN_ETHERNET_SEGMENT" };
+        gMuxOrch = new MuxOrch(m_configDb, octans_mux_tables, gNeighOrch, gFdbOrch);
+        SWSS_LOG_NOTICE("OctansT1: MuxOrch initialized with EVPN_ETHERNET_SEGMENT table");
+    }
+    else
+    {
+        gMuxOrch = new MuxOrch(m_configDb, mux_tables, gTunneldecapOrch, gNeighOrch, gFdbOrch);
+    }
     gDirectory.set(gMuxOrch);
 
     MuxCableOrch *mux_cb_orch = new MuxCableOrch(m_applDb, m_stateDb, APP_MUX_CABLE_TABLE_NAME);
     gDirectory.set(mux_cb_orch);
+
+    if (gMySwitchSubType == "OctansT1")
+    {
+        /* OctansT1: Start LACP state monitoring for mux failover */
+        mux_cb_orch->startLacpStateMonitor(m_stateDb);
+        SWSS_LOG_NOTICE("OctansT1: LACP state monitor started");
+    }
 
     MuxStateOrch *mux_st_orch = new MuxStateOrch(m_stateDb, STATE_HW_MUX_CABLE_TABLE_NAME);
     gDirectory.set(mux_st_orch);

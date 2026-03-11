@@ -68,6 +68,7 @@ public:
     /* HW FRR protection group management */
     sai_status_t createHwFrrProtectionGroups(const std::string &es_port);
     sai_status_t removeHwFrrProtectionGroups(const std::string &es_port);
+    bool isLacpCurrent(const std::string &port_channel);
     sai_status_t updateHwFrrStandbyEcmp(const std::string &es_port,
                                         const std::set<std::string> &active_vteps);
 
@@ -113,6 +114,7 @@ private:
      * of tunnels, arp-term entries, and L3 nexthops at init time */
     std::map<std::string, std::string> m_esPeerVtep;
     std::map<std::string, std::string> m_esSysMac;
+    std::map<std::string, uint32_t> m_esL3Vni; /* Per-ES L3 VNI from ConfigDB */
     std::map<std::string, std::vector<std::string>> m_esPeerVtepList; /* HW FRR: ordered peer VTEP IPs */
 
     /* Per-ES server IPs from config — static mapping of port → server overlay IPs
@@ -138,6 +140,7 @@ private:
         sai_object_id_t nh_local_oid;       // Local NH (via bvi/VLAN RIF)
         bool owns_local_nh;                 // true if we created nh_local_oid
         bool owns_route;                    // true if we created route_entry
+        bool uses_protection;               // true if route → PROTECTION NHG, false if → direct tunnel NH
     };
 
     /*
