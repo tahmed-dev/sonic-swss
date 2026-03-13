@@ -596,27 +596,35 @@ EvpnMhFailoverMode EvpnMhOrch::getEffectiveFailoverMode(const std::string &port_
             return EvpnMhFailoverMode::L2;
         }
 
-        /* Check VRF has a mapped L3VNI */
-        VRFOrch *vrf_orch = gDirectory.get<VRFOrch*>();
-        std::string vrf_name = vrf_orch->getVRFname(vrf_oid);
-        if (vrf_name.empty())
+        /* Check L3VNI availability.  First try explicit per-ES l3_vni from
+         * ConfigDB (m_esL3Vni) — this handles the default VRF case where
+         * VRFOrch has no named VRF entry.  Fall back to VRF→VNI lookup. */
+        auto l3vni_it = m_esL3Vni.find(port_alias);
+        uint32_t l3vni = (l3vni_it != m_esL3Vni.end()) ? l3vni_it->second : 0;
+
+        if (l3vni == 0)
         {
-            return EvpnMhFailoverMode::L2;
+            VRFOrch *vrf_orch = gDirectory.get<VRFOrch*>();
+            std::string vrf_name = vrf_orch->getVRFname(vrf_oid);
+            if (!vrf_name.empty())
+            {
+                l3vni = vrf_orch->getVRFmappedVNI(vrf_name);
+            }
         }
 
-        uint32_t l3vni = vrf_orch->getVRFmappedVNI(vrf_name);
         if (l3vni == 0)
         {
             if (configured == EvpnMhFailoverMode::L3)
             {
-                SWSS_LOG_WARN("EVPN MH: L3 failover requested for %s but no L3VNI for VRF %s, falling back to L2",
-                    port_alias.c_str(), vrf_name.c_str());
+                SWSS_LOG_WARN("EVPN MH: L3 failover requested for %s but no L3VNI found "
+                    "(no explicit l3_vni and VRF lookup failed), falling back to L2",
+                    port_alias.c_str());
             }
             return EvpnMhFailoverMode::L2;
         }
 
-        SWSS_LOG_NOTICE("EVPN MH: effective failover mode for %s is L3 (VRF=%s, L3VNI=%u)",
-            port_alias.c_str(), vrf_name.c_str(), l3vni);
+        SWSS_LOG_NOTICE("EVPN MH: effective failover mode for %s is L3 (L3VNI=%u)",
+            port_alias.c_str(), l3vni);
         return EvpnMhFailoverMode::L3;
     }
 

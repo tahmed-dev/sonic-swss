@@ -1516,10 +1516,24 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
         {
             if (status == SAI_STATUS_ITEM_ALREADY_EXISTS)
             {
-                SWSS_LOG_ERROR("Entry exists: neighbor %s on %s, rv:%d",
-                           macAddress.to_string().c_str(), alias.c_str(), status);
-                /* Returning True so as to skip retry */
-                return true;
+                SWSS_LOG_NOTICE("Entry exists: neighbor %s on %s — updating MAC via set_attribute",
+                           macAddress.to_string().c_str(), alias.c_str());
+                /* Entry may have been pre-created by HW FRR with anycast MAC.
+                 * Update it with the real MAC so VPP adjacency resolves correctly. */
+                for (const auto &itr : neighbor_attrs)
+                {
+                    sai_status_t set_status = sai_neighbor_api->set_neighbor_entry_attribute(
+                        &neighbor_entry, &itr);
+                    if (set_status != SAI_STATUS_SUCCESS)
+                    {
+                        SWSS_LOG_WARN("Failed to update existing neighbor %s on %s, "
+                                      "attr.id=0x%x, rv:%d",
+                                      macAddress.to_string().c_str(), alias.c_str(),
+                                      itr.id, set_status);
+                    }
+                }
+                /* Fall through to treat as successful create — orchagent needs
+                 * to register CRM counters, refcounts, and next-hop for this. */
             }
             else
             {
