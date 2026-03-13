@@ -5,6 +5,7 @@
 #include <utility>
 #include <inttypes.h>
 #include <sstream>
+#include <dirent.h>
 
 #include "logger.h"
 #include "tokenize.h"
@@ -3172,6 +3173,45 @@ void FdbOrch::doEvpnMhNeighTask(Consumer &consumer)
             {
                 m_evpnMhNeighCache[key] = mac;
                 SWSS_LOG_NOTICE("EVPN MH neigh cache: SET %s -> %s", key.c_str(), mac.c_str());
+
+                /*
+                 * Also program the neighbor on bvivlan<N> (VPP BVI tap) so
+                 * kernel-originated replies (e.g., ICMP echo reply from
+                 * the BVI's own IP) use the real server MAC instead of
+                 * the anycast gateway MAC.  Without this, VPP sees
+                 * src==dst==anycast on the BVI and drops as reflection.
+                 *
+                 * Key format: "Vlan<N>:<IP>" — extract VLAN ID to form
+                 * bvivlan<bd_id>.  For VNI-named VLANs (e.g., Vlan3000),
+                 * the BD id is the overlay VLAN (e.g., 10), so we scan
+                 * all bvivlan* interfaces.
+                 */
+                auto colon = key.find(':');
+                if (colon != string::npos)
+                {
+                    string ip = key.substr(colon + 1);
+
+                    /* Program on all bvivlan<N> interfaces */
+                    DIR *d = opendir("/sys/class/net");
+                    if (d)
+                    {
+                        struct dirent *ent;
+                        while ((ent = readdir(d)) != NULL)
+                        {
+                            if (strncmp(ent->d_name, "bvivlan", 7) != 0) continue;
+                            string cmd = "ip neigh replace " + ip +
+                                         " lladdr " + mac +
+                                         " dev " + string(ent->d_name) +
+                                         " nud permanent 2>/dev/null";
+                            if (system(cmd.c_str()) == 0)
+                            {
+                                SWSS_LOG_NOTICE("EVPN MH neigh: programmed %s -> %s on %s",
+                                                ip.c_str(), mac.c_str(), ent->d_name);
+                            }
+                        }
+                        closedir(d);
+                    }
+                }
             }
         }
         else if (op == DEL_COMMAND)
