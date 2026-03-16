@@ -115,6 +115,9 @@ public:
     bool addInbandNeighbor(string alias, IpAddress ip_address);
     bool delInbandNeighbor(string alias, IpAddress ip_address);
 
+    bool programEvpnMhNeighbor(const string &vlan_alias, const IpAddress &ip, const MacAddress &mac);
+    bool removeEvpnMhNeighbor(const string &vlan_alias, const IpAddress &ip);
+
     bool convertToPrefixBasedNbr(const NeighborEntry &neighborEntry, sai_object_id_t tunnel_nexthop_id = SAI_NULL_OBJECT_ID);
     bool isPrefixNeighbor(const NeighborEntry &neighborEntry) const;
     bool isPrefixNeighborNh(const NextHopKey &nextHopKey) const;

@@ -5,7 +5,6 @@
 #include <utility>
 #include <inttypes.h>
 #include <sstream>
-#include <dirent.h>
 
 #include "logger.h"
 #include "tokenize.h"
@@ -3175,41 +3174,29 @@ void FdbOrch::doEvpnMhNeighTask(Consumer &consumer)
                 SWSS_LOG_NOTICE("EVPN MH neigh cache: SET %s -> %s", key.c_str(), mac.c_str());
 
                 /*
-                 * Also program the neighbor on bvivlan<N> (VPP BVI tap) so
-                 * kernel-originated replies (e.g., ICMP echo reply from
-                 * the BVI's own IP) use the real server MAC instead of
-                 * the anycast gateway MAC.  Without this, VPP sees
-                 * src==dst==anycast on the BVI and drops as reflection.
+                 * Program the neighbor via SAI on the VLAN RIF.
+                 * The SAI layer handles all platform-specific details:
+                 *   - On VPP: ip-neighbor + BVI tap neighbor + arp-term
+                 *   - On ASIC: hardware neighbor table
                  *
-                 * Key format: "Vlan<N>:<IP>" — extract VLAN ID to form
-                 * bvivlan<bd_id>.  For VNI-named VLANs (e.g., Vlan3000),
-                 * the BD id is the overlay VLAN (e.g., 10), so we scan
-                 * all bvivlan* interfaces.
+                 * Key format: "Vlan<N>:<IP>"
                  */
                 auto colon = key.find(':');
                 if (colon != string::npos)
                 {
-                    string ip = key.substr(colon + 1);
+                    string vlan_alias = key.substr(0, colon);
+                    string ip_str = key.substr(colon + 1);
 
-                    /* Program on all bvivlan<N> interfaces */
-                    DIR *d = opendir("/sys/class/net");
-                    if (d)
+                    try
                     {
-                        struct dirent *ent;
-                        while ((ent = readdir(d)) != NULL)
-                        {
-                            if (strncmp(ent->d_name, "bvivlan", 7) != 0) continue;
-                            string cmd = "ip neigh replace " + ip +
-                                         " lladdr " + mac +
-                                         " dev " + string(ent->d_name) +
-                                         " nud permanent 2>/dev/null";
-                            if (system(cmd.c_str()) == 0)
-                            {
-                                SWSS_LOG_NOTICE("EVPN MH neigh: programmed %s -> %s on %s",
-                                                ip.c_str(), mac.c_str(), ent->d_name);
-                            }
-                        }
-                        closedir(d);
+                        IpAddress ip(ip_str);
+                        MacAddress mac_addr(mac);
+                        gNeighOrch->programEvpnMhNeighbor(vlan_alias, ip, mac_addr);
+                    }
+                    catch (const exception &e)
+                    {
+                        SWSS_LOG_ERROR("EVPN MH neigh: failed to parse %s: %s",
+                                       key.c_str(), e.what());
                     }
                 }
             }
@@ -3218,6 +3205,23 @@ void FdbOrch::doEvpnMhNeighTask(Consumer &consumer)
         {
             m_evpnMhNeighCache.erase(key);
             SWSS_LOG_NOTICE("EVPN MH neigh cache: DEL %s", key.c_str());
+
+            auto colon = key.find(':');
+            if (colon != string::npos)
+            {
+                string vlan_alias = key.substr(0, colon);
+                string ip_str = key.substr(colon + 1);
+                try
+                {
+                    IpAddress ip(ip_str);
+                    gNeighOrch->removeEvpnMhNeighbor(vlan_alias, ip);
+                }
+                catch (const exception &e)
+                {
+                    SWSS_LOG_ERROR("EVPN MH neigh: failed to parse %s for DEL: %s",
+                                   key.c_str(), e.what());
+                }
+            }
         }
         it = consumer.m_toSync.erase(it);
     }

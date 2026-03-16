@@ -3034,3 +3034,98 @@ void NeighOrch::clearBulkers()
     gNeighBulker.clear();
     gNextHopBulker.clear();
 }
+
+/*
+ * programEvpnMhNeighbor — Program a SAI neighbor entry for a remote EVPN MH
+ * server learned via Type-2 MAC/IP routes.  This is the platform-agnostic
+ * replacement for the VPP-specific bvivlan* kernel manipulation.
+ *
+ * The SAI layer handles all platform details:
+ *   - On VPP: programs ip-neighbor + kernel bvivlan neighbor + arp-term table
+ *   - On ASIC: programs the hardware neighbor table
+ *
+ * Does NOT create a next-hop or route — purely a neighbor/ARP-term entry.
+ */
+bool NeighOrch::programEvpnMhNeighbor(const string &vlan_alias, const IpAddress &ip,
+                                       const MacAddress &mac)
+{
+    SWSS_LOG_ENTER();
+
+    sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(vlan_alias);
+    if (rif_id == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_WARN("EVPN MH neigh: no RIF for %s, deferring %s",
+                      vlan_alias.c_str(), ip.to_string().c_str());
+        return false;
+    }
+
+    sai_neighbor_entry_t neighbor_entry;
+    neighbor_entry.rif_id = rif_id;
+    neighbor_entry.switch_id = gSwitchId;
+    copy(neighbor_entry.ip_address, ip);
+
+    sai_attribute_t attr;
+    attr.id = SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS;
+    memcpy(attr.value.mac, mac.getMac(), 6);
+
+    sai_status_t status = sai_neighbor_api->create_neighbor_entry(
+        &neighbor_entry, 1, &attr);
+
+    if (status == SAI_STATUS_ITEM_ALREADY_EXISTS)
+    {
+        /* Neighbor pre-exists (e.g., from local ARP or evpnmhorch anycast).
+         * Update the MAC to the real server MAC. */
+        status = sai_neighbor_api->set_neighbor_entry_attribute(
+            &neighbor_entry, &attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("EVPN MH neigh: failed to update %s on %s, rv:%d",
+                           ip.to_string().c_str(), vlan_alias.c_str(), status);
+            return false;
+        }
+        SWSS_LOG_NOTICE("EVPN MH neigh: updated %s -> %s on %s (was ALREADY_EXISTS)",
+                        ip.to_string().c_str(), mac.to_string().c_str(),
+                        vlan_alias.c_str());
+    }
+    else if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("EVPN MH neigh: failed to create %s on %s, rv:%d",
+                       ip.to_string().c_str(), vlan_alias.c_str(), status);
+        return false;
+    }
+    else
+    {
+        SWSS_LOG_NOTICE("EVPN MH neigh: created %s -> %s on %s",
+                        ip.to_string().c_str(), mac.to_string().c_str(),
+                        vlan_alias.c_str());
+    }
+    return true;
+}
+
+bool NeighOrch::removeEvpnMhNeighbor(const string &vlan_alias, const IpAddress &ip)
+{
+    SWSS_LOG_ENTER();
+
+    sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(vlan_alias);
+    if (rif_id == SAI_NULL_OBJECT_ID)
+    {
+        return false;
+    }
+
+    sai_neighbor_entry_t neighbor_entry;
+    neighbor_entry.rif_id = rif_id;
+    neighbor_entry.switch_id = gSwitchId;
+    copy(neighbor_entry.ip_address, ip);
+
+    sai_status_t status = sai_neighbor_api->remove_neighbor_entry(&neighbor_entry);
+    if (status != SAI_STATUS_SUCCESS && status != SAI_STATUS_ITEM_NOT_FOUND)
+    {
+        SWSS_LOG_ERROR("EVPN MH neigh: failed to remove %s on %s, rv:%d",
+                       ip.to_string().c_str(), vlan_alias.c_str(), status);
+        return false;
+    }
+
+    SWSS_LOG_NOTICE("EVPN MH neigh: removed %s from %s",
+                    ip.to_string().c_str(), vlan_alias.c_str());
+    return true;
+}
