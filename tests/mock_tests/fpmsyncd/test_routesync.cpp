@@ -846,7 +846,7 @@ TEST_F(FpmSyncdResponseTest, TestRouteMsgWithNHG)
 
         vector<FieldValueTuple> fvs;
         EXPECT_TRUE(route_table.get(test_destipprefix, fvs));
-        EXPECT_EQ(fvs.size(), 11);
+        EXPECT_EQ(fvs.size(), 3);
         for (const auto& fv : fvs) {
             if (fvField(fv) == "nexthop") {
                 EXPECT_EQ(fvValue(fv), test_gateway);
@@ -854,14 +854,6 @@ TEST_F(FpmSyncdResponseTest, TestRouteMsgWithNHG)
                 EXPECT_EQ(fvValue(fv), "Ethernet1");
             } else if (fvField(fv) == "protocol") {
                 EXPECT_EQ(fvValue(fv), "static");
-            } else if (fvField(fv) == "blackhole") {
-                EXPECT_EQ(fvValue(fv), "false");
-            } else if (fvField(fv) == "nexthop_group") {
-                EXPECT_EQ(fvValue(fv), "");
-            } else if (fvField(fv) == "mpls_nh") {
-                EXPECT_EQ(fvValue(fv), "");
-            } else if (fvField(fv) == "weight") {
-                EXPECT_EQ(fvValue(fv), "");
             }
         }
     }

@@ -142,32 +142,12 @@ static string getProtocolString(int proto)
     static constexpr size_t protocolNameBufferSize = 128;
     char buffer[protocolNameBufferSize] = {};
 
-    /*
-     * rtnl_route_proto2str() always returns a non-NULL pointer.
-     * For protocol numbers not in libnl3's translation table (e.g.
-     * RTPROT_BGP = 186), it writes a hex string like "0xba" into
-     * the buffer. Check for that and fall back to our own mapping.
-     */
-    rtnl_route_proto2str(proto, buffer, sizeof(buffer));
-    if (buffer[0] && buffer[0] != '0')
+    if (!rtnl_route_proto2str(proto, buffer, sizeof(buffer)))
     {
-        return buffer;
+        return std::to_string(proto);
     }
 
-    /* libnl3 did not resolve the name; use well-known protocol names.
-     * Values 186-192 are defined in <linux/rtnetlink.h>.
-     * Values 190-196 are FRR-specific (zebra/rt_netlink.h). */
-    switch (proto) {
-    case RTPROT_BGP:    return "bgp";
-    case RTPROT_ISIS:   return "isis";
-    case RTPROT_OSPF:   return "ospf";
-    case RTPROT_RIP:    return "rip";
-    case RTPROT_EIGRP:  return "eigrp";
-    case 190:           return "ripng";   /* RTPROT_RIPNG (FRR) */
-    case 191:           return "nhrp";    /* RTPROT_NHRP (FRR) */
-    case 196:           return "zstatic"; /* RTPROT_ZSTATIC (FRR) */
-    default:  return std::to_string(proto);
-    }
+    return buffer;
 }
 
 /* Helper to create unique pointer with custom destructor */
@@ -1031,7 +1011,7 @@ void RouteSync::onEvpnRouteMsg(struct nlmsghdr *h, int len)
     SWSS_LOG_INFO("RouteTable set EVPN msg: %s vtep:%s vni:%s mac:%s intf:%s protocol:%s",
                   destipprefix, nexthops.c_str(), vni_list.c_str(), mac_list.c_str(), intf_list.c_str(),
                   proto_str.c_str());
-    RouteTableFieldValueTupleWrapper fvw{std::move(destipprefix), std::move(proto_str)};
+    RouteTableFieldValueTupleWrapper fvw{std::move(destipprefix), std::move(proto_str), isNbZmqEnabled()};
     fvw.nexthop = std::move(nexthops);
     fvw.ifname = std::move(intf_list);
     fvw.vni_label = std::move(vni_list);
@@ -1116,17 +1096,39 @@ bool RouteSync::getSrv6VpnRouteNextHop(struct nlmsghdr *h, int received_bytes,
 vector<FieldValueTuple>
 RouteTableFieldValueTupleWrapper::fieldValueTupleVector() {
     vector<FieldValueTuple> fvVector;
-    fvVector.push_back(FieldValueTuple("protocol", protocol.c_str()));
-    fvVector.push_back(FieldValueTuple("blackhole", blackhole.c_str()));
-    fvVector.push_back(FieldValueTuple("nexthop", nexthop.c_str()));
-    fvVector.push_back(FieldValueTuple("ifname", ifname.c_str()));
-    fvVector.push_back(FieldValueTuple("nexthop_group", nexthop_group.c_str()));
-    fvVector.push_back(FieldValueTuple("mpls_nh", mpls_nh.c_str()));
-    fvVector.push_back(FieldValueTuple("weight", weight.c_str()));
-    fvVector.push_back(FieldValueTuple("vni_label", vni_label.c_str()));
-    fvVector.push_back(FieldValueTuple("router_mac", router_mac.c_str()));
-    fvVector.push_back(FieldValueTuple("segment", segment.c_str()));
-    fvVector.push_back(FieldValueTuple("seg_src", seg_src.c_str()));
+    if (includeEmptyFields || protocol != string()) {
+        fvVector.push_back(FieldValueTuple("protocol", protocol.c_str()));
+    }
+    if (includeEmptyFields || blackhole != string("false")) {
+        fvVector.push_back(FieldValueTuple("blackhole", blackhole.c_str()));
+    }
+    if (includeEmptyFields || nexthop != string()) {
+        fvVector.push_back(FieldValueTuple("nexthop", nexthop.c_str()));
+    }
+    if (includeEmptyFields || ifname != string()) {
+        fvVector.push_back(FieldValueTuple("ifname", ifname.c_str()));
+    }
+    if (includeEmptyFields || nexthop_group != string()) {
+        fvVector.push_back(FieldValueTuple("nexthop_group", nexthop_group.c_str()));
+    }
+    if (includeEmptyFields || mpls_nh != string()) {
+        fvVector.push_back(FieldValueTuple("mpls_nh", mpls_nh.c_str()));
+    }
+    if (includeEmptyFields || weight != string()) {
+        fvVector.push_back(FieldValueTuple("weight", weight.c_str()));
+    }
+    if (includeEmptyFields || vni_label != string()) {
+        fvVector.push_back(FieldValueTuple("vni_label", vni_label.c_str()));
+    }
+    if (includeEmptyFields || router_mac != string()) {
+        fvVector.push_back(FieldValueTuple("router_mac", router_mac.c_str()));
+    }
+    if (includeEmptyFields || segment != string()) {
+        fvVector.push_back(FieldValueTuple("segment", segment.c_str()));
+    }
+    if (includeEmptyFields || seg_src != string()) {
+        fvVector.push_back(FieldValueTuple("seg_src", seg_src.c_str()));
+    }
     // Return value optimization will avoid copy of the following vector
     return fvVector;
 }
@@ -1136,12 +1138,24 @@ RouteTableFieldValueTupleWrapper::fieldValueTupleVector() {
 vector<FieldValueTuple>
 LabelRouteTableFieldValueTupleWrapper::fieldValueTupleVector() {
     vector<FieldValueTuple> fvVector;
-    fvVector.push_back(FieldValueTuple("protocol", protocol.c_str()));
-    fvVector.push_back(FieldValueTuple("blackhole", blackhole.c_str()));
-    fvVector.push_back(FieldValueTuple("nexthop", nexthop.c_str()));
-    fvVector.push_back(FieldValueTuple("ifname", ifname.c_str()));
-    fvVector.push_back(FieldValueTuple("mpls_nh", mpls_nh.c_str()));
-    fvVector.push_back(FieldValueTuple("mpls_pop", mpls_pop.c_str()));
+    if (includeEmptyFields || protocol != string()) {
+        fvVector.push_back(FieldValueTuple("protocol", protocol.c_str()));
+    }
+    if (includeEmptyFields || blackhole != string("false")) {
+        fvVector.push_back(FieldValueTuple("blackhole", blackhole.c_str()));
+    }
+    if (includeEmptyFields || nexthop != string()) {
+        fvVector.push_back(FieldValueTuple("nexthop", nexthop.c_str()));
+    }
+    if (includeEmptyFields || ifname != string()) {
+        fvVector.push_back(FieldValueTuple("ifname", ifname.c_str()));
+    }
+    if (includeEmptyFields || mpls_nh != string()) {
+        fvVector.push_back(FieldValueTuple("mpls_nh", mpls_nh.c_str()));
+    }
+    if (includeEmptyFields || mpls_pop != string()) {
+        fvVector.push_back(FieldValueTuple("mpls_pop", mpls_pop.c_str()));
+    }
     return fvVector;
 }
 
@@ -2549,7 +2563,7 @@ void RouteSync::onRouteMsg(int nlmsg_type, struct nl_object *obj, char *vrf)
         case RTN_BLACKHOLE:
         {
             SWSS_LOG_INFO("RouteTable set blackhole msg: %s", destipprefix);
-            RouteTableFieldValueTupleWrapper fvw {std::move(destipprefix), std::move(proto_str)};
+            RouteTableFieldValueTupleWrapper fvw {std::move(destipprefix), std::move(proto_str), isNbZmqEnabled()};
             fvw.blackhole = "true";
             setRouteWithWarmRestart(fvw, *m_routeTable);
             return;
@@ -2567,7 +2581,7 @@ void RouteSync::onRouteMsg(int nlmsg_type, struct nl_object *obj, char *vrf)
             return;
     }
 
-    RouteTableFieldValueTupleWrapper fvw {destipprefix, std::move(proto_str)};
+    RouteTableFieldValueTupleWrapper fvw {destipprefix, std::move(proto_str), isNbZmqEnabled()};
     string gw_list;
     string intf_list;
     string mpls_list;
@@ -3065,7 +3079,7 @@ void RouteSync::onLabelRouteMsg(int nlmsg_type, struct nl_object *obj)
         case RTN_BLACKHOLE:
         {
             SWSS_LOG_INFO("LabelRouteTable set blackhole msg: %s", destaddr);
-            LabelRouteTableFieldValueTupleWrapper fvw{std::move(destaddr), std::move(proto_str)};
+            LabelRouteTableFieldValueTupleWrapper fvw{std::move(destaddr), std::move(proto_str), isNbZmqEnabled()};
             fvw.blackhole = "true";
             setRouteWithWarmRestart(fvw, *m_label_routeTable);
             return;
@@ -3098,7 +3112,7 @@ void RouteSync::onLabelRouteMsg(int nlmsg_type, struct nl_object *obj)
 
     SWSS_LOG_INFO("LabelRouteTable set msg: %s %s %s %s", destaddr,
                   gw_list.c_str(), intf_list.c_str(), mpls_list.c_str());
-    LabelRouteTableFieldValueTupleWrapper fvw{std::move(destaddr), std::move(proto_str)};
+    LabelRouteTableFieldValueTupleWrapper fvw{std::move(destaddr), std::move(proto_str), isNbZmqEnabled()};
     fvw.nexthop = std::move(gw_list);
     fvw.ifname = std::move(intf_list);
     fvw.mpls_pop = "1";
