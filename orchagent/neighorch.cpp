@@ -1556,6 +1556,14 @@ bool NeighOrch::removeNeighbor(NeighborContext& ctx, bool disable)
         return true;
     }
 
+    /* Notify observers only after the SAI delete path succeeds. This keeps
+     * MuxOrch from dropping references for neighbors that failed deletion,
+     * while still clearing mux nexthop state for neighbors that are actually
+     * removed.
+     */
+    NeighborUpdate update = { neighborEntry, MacAddress(), false };
+    notify(SUBJECT_TYPE_NEIGH_CHANGE, static_cast<void *>(&update));
+
     m_syncdNeighbors.erase(neighborEntry);
 
     // TODO: added || isChassisDbInUse()) to Cisco PR
