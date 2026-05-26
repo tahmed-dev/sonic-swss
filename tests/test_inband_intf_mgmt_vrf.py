@@ -14,7 +14,33 @@ class TestInbandInterface(object):
         self.asic_db = dvs.get_asic_db()
         self.cfg_db = swsscommon.DBConnector(4, dvs.redis_sock, 0)
 
+    def wait_for_table_entry(self, db, table_name, key, exists=True):
+        tbl = swsscommon.Table(db, table_name)
+        for _ in range(10):
+            status, fvs = tbl.get(key)
+            if status == exists:
+                return status, fvs
+            time.sleep(1)
+        assert status == exists
+        return status, fvs
+
+    def wait_for_vrf_table_empty(self):
+        tbl = swsscommon.Table(self.appl_db, 'VRF_TABLE')
+        for _ in range(10):
+            vrf_keys = tbl.getKeys()
+            if len(vrf_keys) == 0:
+                return
+            time.sleep(1)
+        assert len(vrf_keys) == 0
+
+    def cleanup_mgmt_vrf(self, dvs):
+        tbl = swsscommon.Table(self.cfg_db, 'MGMT_VRF_CONFIG')
+        tbl._del('vrf_global')
+        dvs.runcmd(["sh", "-c", "ip link show mgmt >/dev/null 2>&1 && ip link del mgmt || true"])
+        self.wait_for_vrf_table_empty()
+
     def add_mgmt_vrf(self, dvs):
+        self.cleanup_mgmt_vrf(dvs)
         initial_entries = set(self.asic_db.get_keys("ASIC_STATE:SAI_OBJECT_TYPE_VIRTUAL_ROUTER")) 
         dvs.runcmd("ip link add mgmt type vrf table 6000")
         dvs.runcmd("ifconfig mgmt up")
@@ -49,15 +75,14 @@ class TestInbandInterface(object):
         time.sleep(5)
 
         # check application database 
-        tbl = swsscommon.Table(self.appl_db, 'VRF_TABLE')
-        vrf_keys = tbl.getKeys()
-        assert len(vrf_keys) == 0
+        self.wait_for_vrf_table_empty()
 
     def del_mgmt_vrf(self, dvs):
-        dvs.runcmd("ip link del mgmt")
         tbl = swsscommon.Table(self.cfg_db, 'MGMT_VRF_CONFIG')
         tbl._del('vrf_global')
+        dvs.runcmd(["sh", "-c", "ip link show mgmt >/dev/null 2>&1 && ip link del mgmt || true"])
         time.sleep(5)
+        self.wait_for_vrf_table_empty()
 
     def create_inband_intf(self, interface):
         cfg_tbl = cfg_key = cfg_fvs = None
