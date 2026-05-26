@@ -499,8 +499,8 @@ pub struct IpfixActor {
     temporary_templates_map: HashMap<u16, String>,
     /// Mapping from message key to template IDs for applied templates
     applied_templates_map: HashMap<String, Vec<u16>>,
-    /// Precomputed lookup from object ID/label to object name for O(1) stat resolution
-    object_id_name_map: HashMap<String, HashMap<u16, String>>,
+    /// Mapping from message key to object names for converting label IDs
+    object_names_map: HashMap<String, Vec<String>>,
 }
 
 impl IpfixActor {
@@ -524,7 +524,7 @@ impl IpfixActor {
             record_recipient,
             temporary_templates_map: HashMap::new(),
             applied_templates_map: HashMap::new(),
-            object_id_name_map: HashMap::new(),
+            object_names_map: HashMap::new(),
         }
     }
 
@@ -608,8 +608,8 @@ impl IpfixActor {
         };
 
         debug!(
-            "Processing IPFIX templates for key: {}, object_names: {:?}, object_ids: {:?}",
-            templates.key, templates.object_names, templates.object_ids
+            "Processing IPFIX templates for key: {}, object_names: {:?}",
+            templates.key, templates.object_names
         );
 
         // Add detailed debug logging for template content if debug level is enabled
@@ -621,41 +621,10 @@ impl IpfixActor {
             }
         }
 
-        if let (Some(object_names), Some(object_ids)) = (&templates.object_names, &templates.object_ids) {
-            if object_ids.len() == object_names.len() {
-                let mut lookup = HashMap::with_capacity(object_ids.len());
-                let mut has_duplicate_object_id = false;
-
-                for (object_id, object_name) in object_ids.iter().copied().zip(object_names.iter().cloned()) {
-                    if let Some(previous_name) = lookup.insert(object_id, object_name.clone()) {
-                        warn!(
-                            "IPFIX template key {} contains duplicate object_id {} ({} -> {}). Skipping object_id_name_map entry to avoid ambiguous label resolution.",
-                            templates.key,
-                            object_id,
-                            previous_name,
-                            object_name
-                        );
-                        has_duplicate_object_id = true;
-                        break;
-                    }
-                }
-
-                if has_duplicate_object_id {
-                    self.object_id_name_map.remove(&templates.key);
-                } else {
-                    self.object_id_name_map.insert(templates.key.clone(), lookup);
-                }
-            } else {
-                warn!(
-                    "IPFIX template object_ids/object_names length mismatch for key {}: ids={}, names={}. Skipping object_id_name_map entry.",
-                    templates.key,
-                    object_ids.len(),
-                    object_names.len()
-                );
-                self.object_id_name_map.remove(&templates.key);
-            }
-        } else {
-            self.object_id_name_map.remove(&templates.key);
+        // Store object names if provided
+        if let Some(object_names) = &templates.object_names {
+            self.object_names_map
+                .insert(templates.key.clone(), object_names.clone());
         }
 
         let cache_ref = Self::get_cache();
@@ -723,8 +692,8 @@ impl IpfixActor {
         self.temporary_templates_map
             .retain(|_, msg_key| msg_key != key);
 
-        // Remove object metadata for this key
-        self.object_id_name_map.remove(key);
+        // Remove object names for this key
+        self.object_names_map.remove(key);
 
         debug!("Template deletion completed for key: {}", key);
     }
@@ -904,12 +873,15 @@ impl IpfixActor {
                                 }
                             }
 
-                            let object_name_lookup = template_key
+                            // Get object names for this template key
+                            let object_names = template_key
                                 .as_ref()
-                                .and_then(|key| self.object_id_name_map.get(key));
+                                .and_then(|key| self.object_names_map.get(key))
+                                .map(|names| names.as_slice())
+                                .unwrap_or(&[]);
 
                             // Create SAIStat directly
-                            let stat = SAIStat::from_ipfix(field_spec, val, object_name_lookup);
+                            let stat = SAIStat::from_ipfix(field_spec, val, object_names);
                             debug!("Created SAIStat: {:?}", stat);
                             final_stats.push(stat);
                         }
@@ -1244,7 +1216,6 @@ mod test {
                 String::from("test_key"),
                 Arc::new(Vec::from(template_bytes)),
                 Some(vec!["Ethernet0".to_string(), "Ethernet1".to_string()]),
-                Some(vec![1, 2]),
             ))
             .await
             .unwrap();

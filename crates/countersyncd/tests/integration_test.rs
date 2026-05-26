@@ -152,7 +152,6 @@ mod end_to_end_tests {
             "test_session|PORT".to_string(),
             Arc::new(template_data),
             Some(vec!["Ethernet0".to_string(), "Ethernet1".to_string()]),
-            Some(vec![1, 2]),
         );
 
         ipfix_template_sender
@@ -260,7 +259,6 @@ mod end_to_end_tests {
             "direct_test".to_string(),
             Arc::new(template_data),
             Some(vec!["Ethernet0".to_string(), "Ethernet1".to_string()]),
-            Some(vec![1, 2]),
         );
 
         ipfix_template_sender

@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use ahash::HashMap;
 use byteorder::{ByteOrder, NetworkEndian};
 use ipfixrw::parser::{DataRecordValue, FieldSpecifier};
 
@@ -16,7 +15,7 @@ use ipfixrw::parser::{DataRecordValue, FieldSpecifier};
 /// information about switch hardware counters and their current values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SAIStat {
-    /// Object name corresponding to the label/object ID mapping
+    /// Object name corresponding to the label ID (1-based index from object_names)
     pub object_name: String,
     /// SAI object type identifier (with possible extensions)
     pub type_id: u32,
@@ -40,7 +39,7 @@ impl SAIStat {
     ///
     /// * `field_spec` - IPFIX field specifier containing identifiers
     /// * `value` - IPFIX data record value containing counter data
-    /// * `object_name_lookup` - Precomputed map from label/object ID to object name
+    /// * `object_names` - Vector of object names (1-based indexing)
     ///
     /// # Returns
     ///
@@ -48,7 +47,7 @@ impl SAIStat {
     pub fn from_ipfix(
         field_spec: &FieldSpecifier,
         value: &DataRecordValue,
-        object_name_lookup: Option<&HashMap<u16, String>>,
+        object_names: &[String],
     ) -> Self {
         let enterprise_number = field_spec.enterprise_number.unwrap_or(0);
         let label = field_spec.information_element_identifier;
@@ -90,11 +89,14 @@ impl SAIStat {
             }
         };
 
-        // Resolve object name from label via a precomputed O(1) lookup map.
-        let object_name = object_name_lookup
-            .and_then(|lookup| lookup.get(&label))
-            .cloned()
-            .unwrap_or_else(|| format!("unknown_{}", label));
+        // Resolve object name from label
+        let object_name = if label > 0 && (label as usize) <= object_names.len() {
+            // Convert 1-based label to 0-based index
+            object_names[(label - 1) as usize].clone()
+        } else {
+            // Fallback to label number if object name not found
+            format!("unknown_{}", label)
+        };
 
         SAIStat {
             object_name,
@@ -238,13 +240,6 @@ mod tests {
     use super::*;
     use ipfixrw::parser::{DataRecordValue, FieldSpecifier};
 
-    fn build_object_name_lookup(entries: &[(u16, &str)]) -> HashMap<u16, String> {
-        entries
-            .iter()
-            .map(|(object_id, name)| (*object_id, (*name).to_string()))
-            .collect()
-    }
-
     /// Helper function to create a test field specifier
     fn create_field_spec(element_id: u16, enterprise_number: Option<u32>) -> FieldSpecifier {
         FieldSpecifier::new(enterprise_number, element_id, 8)
@@ -261,11 +256,11 @@ mod tests {
     fn test_sai_stat_from_ipfix_basic() {
         let field_spec = create_field_spec(2, Some(0x12340000)); // label 2, type_id 0x1234, stat_id 0
         let value = create_byte_value(12345);
-        let object_name_lookup = build_object_name_lookup(&[(1, "Ethernet0"), (2, "Ethernet1")]);
+        let object_names = vec!["Ethernet0".to_string(), "Ethernet1".to_string()];
 
-        let stat = SAIStat::from_ipfix(&field_spec, &value, Some(&object_name_lookup));
+        let stat = SAIStat::from_ipfix(&field_spec, &value, &object_names);
 
-        assert_eq!(stat.object_name, "Ethernet1");
+        assert_eq!(stat.object_name, "Ethernet1"); // label 2 -> index 1 (1-based)
         assert_eq!(stat.type_id, 0x1234);
         assert_eq!(stat.stat_id, 0);
         assert_eq!(stat.counter, 12345);
@@ -277,11 +272,11 @@ mod tests {
         let enterprise_number = 0x80008000 | 0x12340567;
         let field_spec = create_field_spec(1, Some(enterprise_number)); // label 1
         let value = create_byte_value(99999);
-        let object_name_lookup = build_object_name_lookup(&[(1, "Ethernet0")]);
+        let object_names = vec!["Ethernet0".to_string()];
 
-        let stat = SAIStat::from_ipfix(&field_spec, &value, Some(&object_name_lookup));
+        let stat = SAIStat::from_ipfix(&field_spec, &value, &object_names);
 
-        assert_eq!(stat.object_name, "Ethernet0");
+        assert_eq!(stat.object_name, "Ethernet0"); // label 1 -> index 0 (1-based)
         assert_eq!(stat.type_id, 0x1234 + EXTENSIONS_RANGE_BASE);
         assert_eq!(stat.stat_id, 0x0567 + EXTENSIONS_RANGE_BASE);
         assert_eq!(stat.counter, 99999);
@@ -292,9 +287,9 @@ mod tests {
         let field_spec = create_field_spec(1, Some(0x00010002));
         let short_bytes = vec![0x12, 0x34]; // Only 2 bytes instead of 8
         let value = DataRecordValue::Bytes(short_bytes);
-        let object_name_lookup = build_object_name_lookup(&[(1, "Ethernet0")]);
+        let object_names = vec!["Ethernet0".to_string()];
 
-        let stat = SAIStat::from_ipfix(&field_spec, &value, Some(&object_name_lookup));
+        let stat = SAIStat::from_ipfix(&field_spec, &value, &object_names);
 
         assert_eq!(stat.object_name, "Ethernet0");
         assert_eq!(stat.counter, 0x1234); // Should be padded correctly
@@ -304,9 +299,9 @@ mod tests {
     fn test_sai_stat_from_ipfix_non_bytes() {
         let field_spec = create_field_spec(1, Some(0x00050006));
         let value = DataRecordValue::String("test".to_string());
-        let object_name_lookup = build_object_name_lookup(&[(1, "Ethernet0")]);
+        let object_names = vec!["Ethernet0".to_string()];
 
-        let stat = SAIStat::from_ipfix(&field_spec, &value, Some(&object_name_lookup));
+        let stat = SAIStat::from_ipfix(&field_spec, &value, &object_names);
 
         assert_eq!(stat.object_name, "Ethernet0");
         assert_eq!(stat.counter, 0); // Should default to 0 for non-byte values
@@ -316,9 +311,9 @@ mod tests {
     fn test_sai_stat_from_ipfix_invalid_label() {
         let field_spec = create_field_spec(5, Some(0x00010002)); // label 5, out of range
         let value = create_byte_value(1000);
-        let object_name_lookup = build_object_name_lookup(&[(1, "Ethernet0"), (2, "Ethernet1")]); // Only 2 objects
+        let object_names = vec!["Ethernet0".to_string(), "Ethernet1".to_string()]; // Only 2 objects
 
-        let stat = SAIStat::from_ipfix(&field_spec, &value, Some(&object_name_lookup));
+        let stat = SAIStat::from_ipfix(&field_spec, &value, &object_names);
 
         assert_eq!(stat.object_name, "unknown_5"); // Fallback for invalid label
         assert_eq!(stat.type_id, 1);
@@ -330,37 +325,13 @@ mod tests {
     fn test_sai_stat_from_ipfix_zero_label() {
         let field_spec = create_field_spec(0, Some(0x00010002)); // label 0, invalid
         let value = create_byte_value(1000);
-        let object_name_lookup = build_object_name_lookup(&[(1, "Ethernet0")]);
+        let object_names = vec!["Ethernet0".to_string()];
 
-        let stat = SAIStat::from_ipfix(&field_spec, &value, Some(&object_name_lookup));
+        let stat = SAIStat::from_ipfix(&field_spec, &value, &object_names);
 
         assert_eq!(stat.object_name, "unknown_0"); // Fallback for zero label
         assert_eq!(stat.type_id, 1);
         assert_eq!(stat.stat_id, 2);
-        assert_eq!(stat.counter, 1000);
-    }
-
-
-    #[test]
-    fn test_sai_stat_from_ipfix_uses_object_ids_mapping() {
-        let field_spec = create_field_spec(20, Some(0x00010002));
-        let value = create_byte_value(1000);
-        let object_name_lookup = build_object_name_lookup(&[(10, "Ethernet0"), (20, "Ethernet8")]);
-
-        let stat = SAIStat::from_ipfix(&field_spec, &value, Some(&object_name_lookup));
-
-        assert_eq!(stat.object_name, "Ethernet8");
-        assert_eq!(stat.counter, 1000);
-    }
-
-    #[test]
-    fn test_sai_stat_from_ipfix_without_lookup_uses_unknown_label() {
-        let field_spec = create_field_spec(20, Some(0x00010002));
-        let value = create_byte_value(1000);
-
-        let stat = SAIStat::from_ipfix(&field_spec, &value, None);
-
-        assert_eq!(stat.object_name, "unknown_20");
         assert_eq!(stat.counter, 1000);
     }
 
@@ -451,9 +422,9 @@ mod tests {
         let enterprise_number = 0x80008000 | 0x7FFF7FFF; // Maximum values with extensions
         let field_spec = create_field_spec(1, Some(enterprise_number));
         let value = create_byte_value(555);
-        let object_name_lookup = build_object_name_lookup(&[(1, "Ethernet0")]);
+        let object_names = vec!["Ethernet0".to_string()];
 
-        let stat = SAIStat::from_ipfix(&field_spec, &value, Some(&object_name_lookup));
+        let stat = SAIStat::from_ipfix(&field_spec, &value, &object_names);
 
         // Should use saturating_add to prevent overflow
         assert_eq!(stat.type_id, 0x7FFF + EXTENSIONS_RANGE_BASE);
