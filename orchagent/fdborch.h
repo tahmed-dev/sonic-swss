@@ -4,6 +4,7 @@
 #include "orch.h"
 #include "observer.h"
 #include "portsorch.h"
+#include "lib/fdb_defs.h"
 
 enum FdbOrigin
 {
@@ -45,13 +46,6 @@ struct FdbFlushUpdate
     Port port;
 };
 
-enum NEXT_HOP_VALUE_TYPE {
-    UNKNOWN = 0,
-    VTEP = 1,
-    NEXTHOPGROUP = 2,
-    IFNAME = 3
-};
-
 struct FdbData
 {
     sai_object_id_t bridge_port_id = SAI_NULL_OBJECT_ID;
@@ -68,7 +62,7 @@ struct FdbData
     bool is_flush_pending = false;
 
     /* Remote FDB related info */
-    NEXT_HOP_VALUE_TYPE dest_type = UNKNOWN;
+    FdbDest dest_type = FdbDest::UNKNOWN;
     string dest_value;
     string    esi;
     unsigned int vni = 0;
@@ -138,11 +132,11 @@ private:
     NotificationConsumer* m_fdbNotificationConsumer;
     shared_ptr<DBConnector> m_notificationsDb;
 
-    map<NEXT_HOP_VALUE_TYPE, string> destTypeToString =
-        { { UNKNOWN, "Unknown" },
-          { VTEP, "Vtep"},
-          { NEXTHOPGROUP, "NexthopGroup" },
-          { IFNAME, "Ifname" } };
+    map<FdbDest, string> destTypeToString =
+        { { FdbDest::UNKNOWN, "Unknown" },
+          { FdbDest::VTEP, "Vtep"},
+          { FdbDest::NEXTHOPGROUP, "NexthopGroup" },
+          { FdbDest::IFNAME, "Ifname" } };
 
     void doTask(Consumer& consumer);
     void doTask(NotificationConsumer& consumer);
