@@ -153,6 +153,7 @@ int main(int argc, char **argv)
             s.addSelectable(&deviceMetadataTableSubscriber);
             s.addSelectable(macsync.getStateFdbTable());
             s.addSelectable(macsync.getCfgFdbSyncTable());
+            s.addSelectable(macsync.getStaleTimer());
 
             if (sync.isSuppressionEnabled())
             {
@@ -211,6 +212,12 @@ int main(int argc, char **argv)
                 if (temps == (Selectable *)macsync.getCfgFdbSyncTable())
                 {
                     macsync.processCfgFdbSync();
+                    continue;
+                }
+
+                if (temps == (Selectable *)macsync.getStaleTimer())
+                {
+                    macsync.onStaleTimer();
                     continue;
                 }
 
